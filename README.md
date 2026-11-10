@@ -80,6 +80,8 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 # app/build/outputs/apk/debug/app-debug.apk
 ```
 
+Every merge to `main` is built by CI and published automatically as the rolling [`latest` release](../../releases/tag/latest) (`multicam-latest.apk`, debug-signed). Every push and PR also uploads the APK as a workflow artifact.
+
 Install via ADB:
 ```bash
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
