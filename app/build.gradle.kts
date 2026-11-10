@@ -15,8 +15,8 @@ android {
         applicationId = "com.example.multicamtest"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "4.0"
+        versionCode = 5
+        versionName = "5.0"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake { cppFlags += listOf("-std=c++17", "-O3", "-ffast-math", "-Wall", "-Wextra") }

@@ -35,13 +35,17 @@ Synchronously binds Wide and Ultra-Wide physical camera sub-devices:
 
 ## User Interface & Experience
 
-- **Continuous Live Viewfinder**: Real-time camera preview appears immediately upon launch.
-- **Real-Time Stability Meter**: Gyroscope-driven stability badge indicates when the phone is steady enough for optimal burst alignment.
-- **Action-Centric Navigation**:
-  - `INSPECT`: Macro surface detail capture and instant Before/After comparison.
-  - `3D SCAN`: Live stereo depth view and STL model extraction.
-  - `LABS`: Raw calibration pairs, JSON calibration loading, and diagnostic console.
-- **Direct System Sharing**: Instant `Share` and `Open` actions for exported images and 3D STL meshes via Android `FileProvider`.
+Designed for one-handed, thumb-reach use: every control sits in the bottom panel, every touch target is at least 44–48 dp, and the active mode is colour-coded (teal = Inspect, violet = 3D Scan, orange = Labs).
+
+- **Undistorted live viewfinder** with framing reticle; the preview buffer is negotiated 4:3 so nothing is stretched.
+- **Stability badge**: gyroscope-driven `STEADY` / `HOLD STILL` pill that also recolours the reticle.
+- **Mode switcher** (`INSPECT`, `3D SCAN`, `LABS`) with a sliding highlight, haptic tick and disabled while a capture runs.
+- **One big shutter** that morphs into a stop button, shows burst progress as a ring, and gives haptic feedback. The screen stays awake while capturing.
+- **Before/after reveal**: drag the divider, pinch to zoom (up to 4×), double-tap to reset.
+- **3D scan**: live depth heat-map with near/far legend, elapsed timer, one-tap *Finish & build mesh*, then Share STL / Share PLY / Open / New scan.
+- **Labs**: standard vs. full-res streams, one-tap calibration-pair capture, mesh export, and an inline console that expands into a copyable log sheet.
+- **Guide sheet** explaining each mode and tips; Back always closes the topmost layer first.
+- **Direct sharing** of images and meshes through Android `FileProvider`.
 
 ---
 

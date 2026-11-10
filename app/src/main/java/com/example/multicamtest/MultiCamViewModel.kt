@@ -43,8 +43,11 @@ data class UiState(
     val log: List<String> = emptyList(),
     val rawMacro: Boolean = true,
     val fullRes: Boolean = false,
-    val showInfo: Boolean = false,
-    val showLog: Boolean = false,
+    val showGuide: Boolean = false,
+    val showConsole: Boolean = false,
+    val exporting: Boolean = false,
+    val runStartedAt: Long = 0L,
+    val pairsSaved: Int = 0,
 )
 
 /**
@@ -80,9 +83,9 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
                 progress = null,
                 level = Level.INFO,
                 message = when (m) {
-                    Mode.INSPECT -> "Surface Inspection: Hold steady ~10 cm from subject."
-                    Mode.SCAN_3D -> "3D Scanner: Point both cameras at a textured object."
-                    Mode.LABS -> "Labs & Diagnostics: Sensor streams & stereo calibration."
+                    Mode.INSPECT -> "Hold steady about 10 cm from a flat subject."
+                    Mode.SCAN_3D -> "Aim both lenses at a textured object, 15\u201340 cm away."
+                    Mode.LABS -> "Raw stereo stream, calibration pairs and diagnostics."
                 }
             )
         }
@@ -91,8 +94,23 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
 
     fun toggleRaw() = _ui.update { it.copy(rawMacro = !it.rawMacro) }
     fun toggleFullRes() = _ui.update { it.copy(fullRes = !it.fullRes) }
-    fun showInfo(v: Boolean) = _ui.update { it.copy(showInfo = v) }
-    fun showLog(v: Boolean) = _ui.update { it.copy(showLog = v) }
+    fun showGuide(v: Boolean) = _ui.update { it.copy(showGuide = v) }
+    fun showConsole(v: Boolean) = _ui.update { it.copy(showConsole = v) }
+
+    /** Preview stream size chosen for the live viewfinder (landscape sensor orientation). */
+    val previewSize: android.util.Size by lazy { CaptureEngine.choosePreviewSize(getApplication()) }
+
+    /** Back press: close whatever is on top. Returns true if something was dismissed. */
+    fun handleBack(): Boolean {
+        val s = _ui.value
+        return when {
+            s.showGuide -> { showGuide(false); true }
+            s.showConsole -> { showConsole(false); true }
+            s.showComparison || s.lastStlFile != null -> { dismissResult(); true }
+            s.running -> { shutter(); true }
+            else -> false
+        }
+    }
 
     fun toggleComparisonView() {
         _ui.update { it.copy(showAfter = !it.showAfter) }
@@ -111,7 +129,8 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
                 showComparison = false,
                 lastStlFile = null,
                 lastPlyFile = null,
-                message = "Viewfinder Active."
+                lastTriangles = 0,
+                message = "Viewfinder ready."
             )
         }
         engine().resumePreview()
@@ -121,24 +140,32 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
         val s = _ui.value
         if (!s.hasPermission) return
         if (s.running) {
-            if (s.mode == Mode.SCAN_3D) {
-                // If scanning, shutter button stops and extracts model
-                exportMesh()
-            }
             engine().stop()
-            _ui.update { it.copy(running = false, progress = null, level = Level.INFO, message = "Stopped.") }
+            _ui.update {
+                it.copy(
+                    running = false, progress = null, level = Level.INFO, message = "Stopped.",
+                    image = if (s.mode == Mode.SCAN_3D) it.image else null,
+                )
+            }
+            // In 3D mode, stopping the stream finishes the scan and builds the mesh.
+            if (s.mode == Mode.SCAN_3D) exportMesh()
             return
         }
         _ui.update {
             it.copy(
                 running = true,
+                runStartedAt = android.os.SystemClock.elapsedRealtime(),
                 progress = null,
                 level = Level.BUSY,
                 showComparison = false,
                 image = null,
                 beforeBitmap = null,
                 afterBitmap = null,
-                message = if (s.mode == Mode.INSPECT) "Capturing burst..." else "Starting 3D Scan..."
+                message = when (s.mode) {
+                    Mode.INSPECT -> "Capturing burst\u2026"
+                    Mode.SCAN_3D -> "Starting 3D scan\u2026"
+                    Mode.LABS -> "Starting stereo stream\u2026"
+                }
             )
         }
         if (s.mode == Mode.INSPECT) {
@@ -149,15 +176,20 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
     }
 
     fun savePair() {
-        if (_ui.value.running) engine().savePair()
+        if (_ui.value.running) {
+            engine().savePair()
+            _ui.update { it.copy(pairsSaved = it.pairsSaved + 1) }
+        }
     }
 
     fun exportMesh() {
+        if (_ui.value.exporting) return
+        _ui.update { it.copy(exporting = true, level = Level.BUSY, message = "Building 3D mesh\u2026") }
         viewModelScope.launch(Dispatchers.IO) {
             val tris = engine().exportMesh()
             _ui.update {
-                if (tris > 0) it.copy(level = Level.OK, message = "Mesh exported: $tris triangles")
-                else it.copy(level = Level.ERROR, message = "No mesh generated - scan a textured object first.")
+                if (tris > 0) it.copy(exporting = false, level = Level.OK, message = "Mesh exported: $tris triangles")
+                else it.copy(exporting = false, level = Level.ERROR, message = "No mesh yet \u2014 scan a textured object for a few seconds first.")
             }
         }
     }
@@ -250,6 +282,7 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
                 lastStlFile = stlFile,
                 lastPlyFile = plyFile,
                 lastTriangles = triangleCount,
+                image = if (triangleCount > 0) it.image else null,
                 running = false,
                 progress = null,
                 level = if (triangleCount > 0) Level.OK else Level.ERROR,

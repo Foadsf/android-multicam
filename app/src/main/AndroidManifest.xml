@@ -6,6 +6,8 @@
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="true" />
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="MultiCam Macro &amp; 3D"
         android:largeHeap="true"
         android:supportsRtl="true"

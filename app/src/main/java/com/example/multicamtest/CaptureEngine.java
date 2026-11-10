@@ -5,6 +5,8 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -66,6 +68,9 @@ public final class CaptureEngine {
     private final Handler cameraHandler;
     private final Executor cameraExecutor;
 
+    /** Sensor mounting angle of the wide camera; used only to rotate display bitmaps upright. */
+    private int sensorOrientation = 90;
+
     private SensorManager sensorManager;
     private Sensor gyroSensor;
     private float currentStability = 1.0f;
@@ -122,7 +127,43 @@ public final class CaptureEngine {
             }
         }
 
+        try {
+            CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+            Integer so = cm.getCameraCharacteristics(PHYS_ID_WIDE).get(CameraCharacteristics.SENSOR_ORIENTATION);
+            if (so != null) sensorOrientation = so;
+        } catch (Exception e) { Log.w(TAG, "Sensor orientation lookup failed", e); }
+
         NativeEngine.startImuLooper();
+    }
+
+    /**
+     * Largest 4:3 SurfaceTexture size of the wide camera not exceeding ~2 MP (falls back to 1440x1080).
+     * The viewfinder is laid out with this aspect ratio so the live preview is never stretched.
+     */
+    public static Size choosePreviewSize(Context context) {
+        Size best = new Size(1440, 1080);
+        try {
+            CameraManager cm = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+            StreamConfigurationMap map = cm.getCameraCharacteristics(PHYS_ID_WIDE).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            Size[] sizes = map != null ? map.getOutputSizes(SurfaceTexture.class) : null;
+            long bestArea = 0;
+            if (sizes != null) {
+                for (Size sz : sizes) {
+                    long area = (long) sz.getWidth() * sz.getHeight();
+                    boolean fourThree = Math.abs(sz.getWidth() * 3 - sz.getHeight() * 4) <= 8;
+                    if (fourThree && area <= 2_100_000L && area > bestArea) { best = sz; bestArea = area; }
+                }
+            }
+        } catch (Exception e) { Log.w(TAG, "Preview size negotiation fallback", e); }
+        return best;
+    }
+
+    /** Rotate a sensor-oriented bitmap so it appears upright when the phone is held in portrait. */
+    private Bitmap upright(Bitmap src) {
+        if (src == null || sensorOrientation == 0) return src;
+        Matrix m = new Matrix();
+        m.postRotate(sensorOrientation);
+        return Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, true);
     }
 
     public File outputDir() { return ctx.getExternalFilesDir(null); }
@@ -469,7 +510,7 @@ public final class CaptureEngine {
         int[] copy = Arrays.copyOf(heatmapPixels, heatmapPixels.length);
         Bitmap bm = Bitmap.createBitmap(dw, dh, Bitmap.Config.ARGB_8888);
         bm.setPixels(copy, 0, dw, 0, 0, dw, dh);
-        listener.onImage(bm);
+        listener.onImage(upright(bm));
     }
 
     private static void writePgm(FrameSlot s, File f) {
@@ -591,7 +632,7 @@ public final class CaptureEngine {
                                     o.inSampleSize = 8;
                                     Bitmap afterBm = BitmapFactory.decodeFile(bmp.getAbsolutePath(), o);
                                     setState("Finished! 2\u00d7 Super-Resolution Ready.", Color.rgb(0,230,118));
-                                    listener.onMacroResult(baselineBeforeBitmap, afterBm, bmp);
+                                    listener.onMacroResult(upright(baselineBeforeBitmap), upright(afterBm), bmp);
                                 } else {
                                     setState("Reconstruction failed.", Color.rgb(255,138,128));
                                 }
