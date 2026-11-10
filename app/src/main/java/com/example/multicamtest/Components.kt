@@ -188,7 +188,7 @@ fun Segmented(
         val x by animateDpAsState(segW * selected, spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow), label = "seg")
         Box(
             Modifier
-                .offset(x = x)
+                .offset { IntOffset(x.roundToPx(), 0) }
                 .width(segW)
                 .fillMaxHeight()
                 .clip(shape)

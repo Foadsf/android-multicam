@@ -8,8 +8,12 @@ Contributions to this project are welcome. A few ground rules keep this app smal
 - **No device-specific binary patching.** Camera pipelines must use documented Android Camera2 (API 28+) logical multi-camera features and NDK sensor loops. If a manufacturer HAL refuses concurrent physical streams, fail gracefully with clear diagnostic messages.
 - **Clean architecture.** Camera and sensor loops run in dedicated background executors; UI is declarative Kotlin + Jetpack Compose (Material 3).
 
+- **Claims must be tested.** Algorithmic changes need a check in `native-tests/engine_test.cpp` against independent ground truth. Do not describe behaviour in the UI or README that no test or device log supports.
+- **No device-specific constants.** Camera IDs, sizes, focal lengths and axis conventions must come from Camera2 metadata (see `CameraTopology`).
+
 ## Pull Requests
 
+0. Run the host tests: `./native-tests/run.sh`
 1. Verify that the build succeeds locally:
    ```bash
    ./gradlew assembleDebug

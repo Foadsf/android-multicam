@@ -7,11 +7,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   assemble-debug:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write # needed only by the publish step on the default branch
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Native engine unit tests (host, no device needed)
+        run: ./native-tests/run.sh
 
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
@@ -41,3 +50,21 @@ jobs:
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      # Runs only for commits that land on the default branch (e.g. a merged PR):
+      # publishes the freshly built APK as a rolling "latest" GitHub release.
+      - name: Publish rolling "latest" release
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short="${GITHUB_SHA::7}"
+          cp app/build/outputs/apk/debug/app-debug.apk "multicam-${short}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk multicam-latest.apk
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest build (${short})" \
+            --notes "Automatic debug-signed build of ${GITHUB_SHA} from ${GITHUB_REF_NAME}. Sideload it, or: adb install -r -g multicam-latest.apk" \
+            "multicam-${short}.apk" multicam-latest.apk
