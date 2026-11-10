@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+build/
+app/build/
+app/.cxx/
+.cxx/
+local.properties
+*.iml
+.idea/
+*.log
+
+# Keystores and private configs
+*.keystore
+*.jks
+keystore.properties
+.DS_Store
