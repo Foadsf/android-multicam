@@ -14,3 +14,4 @@ local.properties
 *.jks
 keystore.properties
 .DS_Store
+repomix-output.xml

@@ -513,11 +513,16 @@ public:
         RrefT[0]=Rref[0]; RrefT[1]=Rref[3]; RrefT[2]=Rref[6]; RrefT[3]=Rref[1]; RrefT[4]=Rref[4]; RrefT[5]=Rref[7]; RrefT[6]=Rref[2]; RrefT[7]=Rref[5]; RrefT[8]=Rref[8];
         ImuFusionBuffer::matMul3x3(Rcur, RrefT, Rrel);
 
+        // Note: Handheld translation tracking uses central depth centroid shift
+        // as a fast relative approximation. Multi-view bundle adjustment / VIO
+        // is recommended for metric-scale SLAM.
         float tRel[3] = {0, 0, 0};
         if (validC) for (int k = 0; k < 3; ++k) tRel[k] = std::max(-40.0f, std::min(40.0f, curC[k] - refCentroidMm_[k]));
         integrateTsdf(depthMm.data(), dw, dh, rectFx_, rectFy_, rectCx_, rectCy_, Rrel, tRel);
         return ++integratedFrames_;
     }
+    // Extracts voxel isosurface using Kuhn Marching Tetrahedra into binary STL and indexed PLY.
+    // Note: Isosurface extraction produces a triangular mesh; watertightness depends on closed volume boundaries.
     int exportWatertightMesh(const char* stlPath, const char* plyPath) {
         std::lock_guard<std::mutex> lk(mtx_);
         std::vector<Vertex3D> verts; std::vector<IndexedTriangle> tris;
@@ -543,7 +548,13 @@ private:
         }
         int bestDy = 0; float bestS = -1.0f;
         for (int dy = -6; dy <= 6; ++dy) {
-            float s = 0; for (int y = 12; y < h - 12; ++y) s += pL[y] * pR[y + dy];
+            float s = 0;
+            for (int y = 12; y < h - 12; ++y) {
+                int targetY = y + dy;
+                if (targetY >= 0 && targetY < h) {
+                    s += pL[y] * pR[targetY];
+                }
+            }
             if (s > bestS) { bestS = s; bestDy = dy; }
         }
         return bestDy;
