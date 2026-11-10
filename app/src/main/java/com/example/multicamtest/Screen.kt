@@ -81,11 +81,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
 
-private const val MIME_BMP = "image/bmp"
+private const val MIME_JPEG = "image/jpeg"
+private const val BURST = CaptureEngine.MICROSCOPE_BURST_FRAMES
 private const val MIME_BIN = "application/octet-stream"
 
 @Composable
-fun MultiCamScreen(vm: MultiCamViewModel, onRequestPermission: () -> Unit) {
+fun MultiCamScreen(vm: MultiCamViewModel, onRequestPermission: () -> Unit, onImportCalibration: () -> Unit) {
     val s by vm.ui.collectAsStateWithLifecycle()
     val view = LocalView.current
 
@@ -111,7 +112,7 @@ fun MultiCamScreen(vm: MultiCamViewModel, onRequestPermission: () -> Unit) {
                 ) {
                     Viewfinder(s, vm, accent)
                 }
-                ControlPanel(s, vm, accent)
+                ControlPanel(s, vm, accent, onImportCalibration)
             }
             if (s.showGuide) GuideSheet(accent) { vm.showGuide(false) }
             if (s.showConsole) ConsoleSheet(s.log) { vm.showConsole(false) }
@@ -163,7 +164,8 @@ private fun Viewfinder(s: UiState, vm: MultiCamViewModel, accent: Color) {
     // Preview buffers are landscape; the phone is portrait-locked, so the view is h:w.
     val aspect = preview.height.toFloat() / preview.width.toFloat()
     val borderColor by animateColorAsState(if (s.running) accent else Palette.Outline, tween(300), label = "vfBorder")
-    val showHeatmap = s.image != null && s.mode != Mode.INSPECT
+    val hasDepth by vm.hasDepth.collectAsStateWithLifecycle()
+    val showHeatmap = hasDepth && s.mode != Mode.INSPECT
     val hasModel = s.lastStlFile != null && s.lastTriangles > 0
 
     Box(
@@ -202,29 +204,27 @@ private fun Viewfinder(s: UiState, vm: MultiCamViewModel, accent: Color) {
                 accent = accent, modifier = Modifier.fillMaxSize(),
             )
         } else if (showHeatmap) {
-            Image(
-                bitmap = s.image.asImageBitmap(),
-                contentDescription = "Live stereo depth map",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize().background(Color.Black),
-            )
+            DepthLayer(vm)
             if (!hasModel) DepthLegend(Modifier.align(Alignment.CenterEnd).padding(end = 10.dp))
         }
 
         // 3. Framing reticle on the live preview
         if (!s.showComparison && !showHeatmap) {
-            Reticle(
-                color = if (s.stability >= 0.7f) accent else Palette.Warn,
-                modifier = Modifier.align(Alignment.Center).fillMaxWidth(0.52f).aspectRatio(1f),
-            )
+            ReticleHost(vm, accent, Modifier.align(Alignment.Center).fillMaxWidth(0.52f).aspectRatio(1f))
         }
 
         // 4. Top-of-viewfinder chips
         if (!s.showComparison) {
-            StabilityPill(s.stability, Modifier.align(Alignment.TopStart).padding(12.dp))
-            when {
-                s.running && s.mode != Mode.INSPECT -> RecordingTag(s.runStartedAt, Modifier.align(Alignment.TopEnd).padding(12.dp))
-                s.mode == Mode.INSPECT && !s.running -> Tag(if (s.rawMacro) "RAW16 · 20 FRAMES" else "YUV · 20 FRAMES", accent, Modifier.align(Alignment.TopEnd).padding(12.dp).background(Palette.Glass, RoundedCornerShape(50)))
+            StabilityHost(vm, Modifier.align(Alignment.TopStart).padding(12.dp))
+            Column(Modifier.align(Alignment.TopEnd).padding(12.dp), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                when {
+                    s.running && s.mode != Mode.INSPECT -> {
+                        RecordingTag(s.runStartedAt)
+                        if (s.calibration.isNotEmpty()) Tag(calibrationBadge(s.calibration), accent, Modifier.background(Palette.Glass, RoundedCornerShape(50)))
+                    }
+                    s.mode == Mode.INSPECT && !s.running ->
+                        Tag(if (s.rawMacro && s.rawAvailable) "RAW16 · $BURST FRAMES" else "YUV · $BURST FRAMES", accent, Modifier.background(Palette.Glass, RoundedCornerShape(50)))
+                }
             }
         }
 
@@ -273,6 +273,36 @@ private fun Viewfinder(s: UiState, vm: MultiCamViewModel, accent: Color) {
 }
 
 @Composable
+private fun DepthLayer(vm: MultiCamViewModel) {
+    val bmp by vm.depth.collectAsStateWithLifecycle()
+    val b = bmp ?: return
+    Image(
+        bitmap = b.asImageBitmap(),
+        contentDescription = "Live stereo depth map",
+        contentScale = ContentScale.Crop,
+        modifier = Modifier.fillMaxSize().background(Color.Black),
+    )
+}
+
+@Composable
+private fun StabilityHost(vm: MultiCamViewModel, modifier: Modifier) {
+    val st by vm.stability.collectAsStateWithLifecycle()
+    StabilityPill(st, modifier)
+}
+
+@Composable
+private fun ReticleHost(vm: MultiCamViewModel, accent: Color, modifier: Modifier) {
+    val st by vm.stability.collectAsStateWithLifecycle()
+    Reticle(color = if (st >= 0.7f) accent else Palette.Warn, modifier = modifier)
+}
+
+private fun calibrationBadge(source: String): String = when {
+    source.startsWith("calibration file") -> "CALIBRATION FILE"
+    source.startsWith("device-reported") -> "DEVICE POSE"
+    else -> "UNCALIBRATED"
+}
+
+@Composable
 private fun RecordingTag(startedAt: Long, modifier: Modifier = Modifier) {
     var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     LaunchedEffect(startedAt) {
@@ -311,7 +341,8 @@ private fun ModelCard(s: UiState, accent: Color) {
             Tag(s.lastPlyFile?.name ?: "PLY", accent)
         }
         Text(
-            "Uncalibrated scale is approximate. Load stereo_calibration.json in Labs for metric accuracy.",
+            if (s.calibration.startsWith("estimated")) "Scale is approximate (no calibration found). Import a stereo_calibration.json in Labs for metric accuracy."
+            else "Scale source: ${s.calibration}. Position tracking is approximate, so treat dimensions as indicative.",
             style = Type.Small,
         )
     }
@@ -338,7 +369,7 @@ private fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier =
 // ---------------------------------------------------------------------------------------------
 
 @Composable
-private fun ControlPanel(s: UiState, vm: MultiCamViewModel, accent: Color) {
+private fun ControlPanel(s: UiState, vm: MultiCamViewModel, accent: Color, onImportCalibration: () -> Unit) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val hasModel = s.lastStlFile != null && s.lastTriangles > 0
@@ -365,11 +396,11 @@ private fun ControlPanel(s: UiState, vm: MultiCamViewModel, accent: Color) {
         ) { state ->
             when (state) {
                 PanelState.IMAGE_RESULT -> ResultActions(
-                    caption = "Preview is downscaled — the full 8064×6048 image is saved on the device.",
+                    caption = "Saved ${s.lastResultFile?.name ?: ""} · ${s.resultW}×${s.resultH} px. The preview is downscaled; Open shows the full file.",
                     accent = accent,
-                    onShare = { vm.shareFile(context, s.lastResultFile, MIME_BMP) },
+                    onShare = { vm.shareFile(context, s.lastResultFile, MIME_JPEG) },
                     shareLabel = "Share",
-                    onOpen = { vm.openFile(context, s.lastResultFile, MIME_BMP) },
+                    onOpen = { vm.openFile(context, s.lastResultFile, MIME_JPEG) },
                     onAgain = { vm.dismissResult() },
                     againLabel = "Retake",
                 )
@@ -384,7 +415,7 @@ private fun ControlPanel(s: UiState, vm: MultiCamViewModel, accent: Color) {
                     extraLabel = "Share PLY",
                     onExtra = { vm.shareFile(context, s.lastPlyFile, MIME_BIN) },
                 )
-                PanelState.CAPTURE -> CaptureControls(s, vm, accent) { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+                PanelState.CAPTURE -> CaptureControls(s, vm, accent, onImportCalibration) { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
             }
         }
 
@@ -431,12 +462,12 @@ private fun ResultActions(
 }
 
 @Composable
-private fun CaptureControls(s: UiState, vm: MultiCamViewModel, accent: Color, onTap: () -> Unit) {
+private fun CaptureControls(s: UiState, vm: MultiCamViewModel, accent: Color, onImportCalibration: () -> Unit, onTap: () -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // Context options
         Box(Modifier.heightIn(min = 44.dp), contentAlignment = Alignment.Center) {
             when (s.mode) {
-                Mode.INSPECT -> Segmented(
+                Mode.INSPECT -> if (s.rawAvailable) Segmented(
                     items = listOf(
                         SegItem("RAW · BEST", description = "Use raw sensor data for best quality"),
                         SegItem("YUV · FAST", description = "Use processed colour frames, faster"),
@@ -445,21 +476,30 @@ private fun CaptureControls(s: UiState, vm: MultiCamViewModel, accent: Color, on
                     enabled = !s.running, stacked = false,
                     modifier = Modifier.widthIn(max = 300.dp),
                 ) { if ((it == 0) != s.rawMacro) vm.toggleRaw() }
+                else Text("Processed frames (this camera offers no RAW)", style = Type.Small.copy(fontSize = 13.sp), textAlign = TextAlign.Center)
 
                 Mode.SCAN_3D -> Text(
-                    if (s.running) "Move slowly in an arc around the object" else "Keep the object centred, 15–40 cm from the lenses",
+                    when {
+                        !s.stereoAvailable -> "Needs two back cameras exposed as one logical camera"
+                        s.running -> "Move slowly in an arc around the object"
+                        s.zMaxMm > 0f -> "Keep the object %.0f–%.0f cm from the lenses".format(s.zMinMm / 10f, minOf(s.zMaxMm, 600f) / 10f)
+                        else -> "Keep the object centred and a hand's length away"
+                    },
                     style = Type.Small.copy(fontSize = 13.sp), textAlign = TextAlign.Center,
                 )
 
-                Mode.LABS -> Segmented(
-                    items = listOf(
-                        SegItem("STANDARD", description = "Standard stream resolution"),
-                        SegItem("FULL-RES", description = "Full sensor resolution on both cameras"),
-                    ),
-                    selected = if (s.fullRes) 1 else 0, accent = accent, height = 44.dp,
-                    enabled = !s.running, stacked = false,
-                    modifier = Modifier.widthIn(max = 300.dp),
-                ) { if ((it == 1) != s.fullRes) vm.toggleFullRes() }
+                Mode.LABS -> Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Segmented(
+                        items = listOf(
+                            SegItem("STANDARD", description = "Standard stream resolution"),
+                            SegItem("LARGEST", description = "Largest stream size both cameras share"),
+                        ),
+                        selected = if (s.fullRes) 1 else 0, accent = accent, height = 44.dp,
+                        enabled = !s.running, stacked = false,
+                        modifier = Modifier.widthIn(max = 250.dp),
+                    ) { if ((it == 1) != s.fullRes) vm.toggleFullRes() }
+                    IconBtn(Ic.Open, "Import stereo calibration file", size = 44.dp, background = Palette.SurfaceHigh, enabled = !s.running, onClick = onImportCalibration)
+                }
             }
         }
 
@@ -478,7 +518,7 @@ private fun CaptureControls(s: UiState, vm: MultiCamViewModel, accent: Color, on
                 }
                 Shutter(
                     running = s.running, progress = s.progress, accent = accent, description = label,
-                    enabled = s.hasPermission && !s.exporting,
+                    enabled = s.hasPermission && !s.exporting && (s.mode == Mode.INSPECT || s.stereoAvailable || s.running),
                 ) { onTap(); vm.shutter() }
                 Spacer(Modifier.height(6.dp))
                 Text(label.uppercase(), style = Type.Label.copy(color = Palette.Text, fontSize = 11.sp))
@@ -515,11 +555,11 @@ private fun GuideSheet(accent: Color, onDismiss: () -> Unit) {
                 IconBtn(Ic.Close, "Close guide", size = 44.dp, background = Palette.SurfaceHigh, onClick = onDismiss)
             }
             GuideCard(Ic.Macro, Palette.Accent, "Surface Inspection",
-                "Hold the phone about 10 cm from a flat subject — PCBs, prints, fabric, coins. A 20-frame burst is aligned with the gyroscope and merged onto a 2× sub-pixel grid. Slide the divider afterwards to compare with a single frame.")
+                "Hold the phone about 10 cm from a flat subject — PCBs, prints, fabric, coins. A 20-frame burst is aligned with the gyroscope and merged onto a 2× sub-pixel grid. Slide the divider afterwards to compare with a single frame. Focus and exposure are locked first, which takes a moment.")
             GuideCard(Ic.Cube, Palette.Violet, "3D Scanner",
                 "Uses the wide and ultra-wide cameras together as a stereo pair. Move slowly around a textured object, then tap Finish to build an STL + PLY mesh you can share to a slicer or viewer.")
             GuideCard(Ic.Labs, Palette.Orange, "Labs",
-                "Raw dual-camera stream, synchronized calibration-pair capture (PGM) and mesh export. Put a stereo_calibration.json in the app folder for metric scale.")
+                "Raw dual-camera stream, synchronized calibration-pair capture (PGM) and mesh export. Import a stereo_calibration.json (OpenCV stereoCalibrate output) for metric scale; otherwise the lens pose reported by the phone, or a generic estimate, is used.")
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Palette.SurfaceHigh).padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),

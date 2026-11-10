@@ -17,9 +17,9 @@ android {
         targetSdk = 35
         versionCode = 5
         versionName = "5.0"
-        ndk { abiFilters += listOf("arm64-v8a") }
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
         externalNativeBuild {
-            cmake { cppFlags += listOf("-std=c++17", "-O3", "-ffast-math", "-Wall", "-Wextra") }
+            cmake { cppFlags += listOf("-std=c++17") }
         }
     }
 

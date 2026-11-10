@@ -1,94 +1,88 @@
 # MultiCam Macro & 3D
 
-MultiCam Macro & 3D is an experimental, fully open-source (GPL-3.0) Android Camera2 instrument providing:
-- **Handheld Gyro-Assisted Macro Super-Resolution**: Designed for mostly planar subjects (PCB solder fillets, textiles, coins, prints).
-- **Dual-Camera Stereo Depth Estimation**: Synchronous Wide (`Camera 0`) and Ultra-Wide (`Camera 2`) streaming under a single logical multi-camera handle.
-- **TSDF Voxel Isosurface Reconstruction**: Kuhn Marching Tetrahedra volumetric fusion exporting binary **STL** and **PLY** models.
-- **100% On-Device Processing**: Completely offline; **zero network permissions** (`android.permission.INTERNET` is strictly omitted).
+Free software (GPL-3.0) Android Camera2 instrument for close-up inspection and dual-camera 3D scanning.
+Everything runs on the phone; the APK declares **no network permission**.
 
-> **Note on Calibration & Metric Scale**:
-> Uncalibrated stereo scanning operates with empirical baseline and focal estimates (~18.5 mm baseline, central depth centroid translation tracking). Metric accuracy and reconstruction fidelity depend on external stereo calibration (`stereo_calibration.json`) and scene geometry. Mesh export produces a voxel-grid isosurface; topological 2-manifold watertightness depends on scene boundary closure.
+| Mode | What it does |
+|---|---|
+| **Inspect** | Captures a 20-frame burst of a close subject, aligns the frames (gyroscope prior + image refinement) and merges them onto a 2× sub-pixel grid, then lightly sharpens. A draggable before/after view compares it with the first single frame. |
+| **3D Scan** | Streams two back cameras of a logical multi-camera together, estimates stereo depth (census + semi-global matching), fuses it into a TSDF volume and exports **STL** and **PLY** meshes. |
+| **Labs** | Raw dual-stream view, synchronised calibration-pair capture (PGM), mesh export, calibration-file import and a copyable console. |
 
----
+## What it does *not* claim
 
-## Core Capabilities
+* **Resolution.** A bare phone lens is diffraction/aberration limited long before 2× sampling. Super-resolution removes
+  Bayer/aliasing artefacts and recovers edge contrast up to that limit; it does not turn a phone into a microscope.
+* **Metric accuracy.** Stereo depth is only metric when the baseline is right. Scale comes, in order of preference, from
+  an imported `stereo_calibration.json`, the lens pose the phone reports (Camera2 `LENS_POSE_TRANSLATION`), or a generic
+  15 mm estimate (the UI then says *UNCALIBRATED*). Handheld camera motion is tracked from the IMU rotation plus a depth-centroid
+  translation estimate — good for object-sized scans, **not** SLAM-grade. Meshes are isosurfaces and are usually open shells.
+* **Device coverage is unverified on real hardware.** Camera selection uses only documented Camera2 metadata (no hard-coded IDs,
+  sizes or focal lengths) and falls back gracefully, but the author has not tested every vendor. See *Verification*.
 
-### 1. Surface Inspection (Macro Super-Resolution)
-Exploits natural human hand tremor across a 20-frame burst to eliminate Bayer demosaicing artifacts and increase effective resolving power:
-- **Gyroscope-Assisted Alignment**: Integrates angular velocity over sensor exposure periods using Rodrigues rotation kinematics ($H = K R K^{-1}$) to project frames onto a shared reference plane.
-- **2× Drizzle Accumulator**: Sub-pixel phase-shift accumulation onto an $8064 \times 6048$ grid.
-- **Interactive Before/After Comparison**: Compares the single-frame baseline directly with the reconstructed super-resolution output.
-- **Optical Resolution Envelope**:
-  With primary focal length $f \approx 4.3\text{ mm}$, minimum focus distance $d_0 \approx 90\text{ mm}$, and sensor pixel pitch $p = 1.4\ \mu\text{m}$, the geometric footprint on the object plane is:
-  $$\text{Footprint} = \frac{p}{M} \approx \frac{1.4\ \mu\text{m}}{0.05} \approx 28\ \mu\text{m}$$
-  By Nyquist-Shannon criteria ($2 \times 28\ \mu\text{m} = 56\ \mu\text{m}$) and the $f/2.4$ Airy disk ($\approx 64\ \mu\text{m}$), the physical resolving limit of the bare phone lens is **$\sim 60\text{--}80\ \mu\text{m}$**.
+## How the hardware is chosen (vendor-neutral)
 
-### 2. 3D Scanning (Stereo Depth & Mesh Extraction)
-Synchronously binds Wide and Ultra-Wide physical camera sub-devices:
-- **Logical Multi-Camera Session**: Uses Camera2 `OutputConfiguration.setPhysicalCameraId("0")` (Wide) and `setPhysicalCameraId("2")` (Ultra-Wide).
-- **Census + Semi-Global Matching (SGM)**: Stereo disparity calculation across physical perspectives.
-- **Real-Time Depth Heatmap**: Live false-color depth preview rendered directly in the viewfinder.
-- **TSDF Isosurface Export**: Fuses depth maps into a 3D Truncated Signed Distance Field (TSDF) voxel grid and extracts meshes via Kuhn Marching Tetrahedra into **STL** and **PLY** files.
-- **Calibration Pair Capture**: Stores synchronized uncompressed PGM frame pairs for offline calibration.
+`CameraTopology` inspects every back camera and logical multi-camera:
 
----
+* **Macro camera** = the lens (or physical sub-camera) with the highest thin-lens magnification at its closest focus distance.
+  It opens directly if the framework lists it, otherwise through its logical camera with physical-stream routing.
+* **Stereo pair** = two physical sub-cameras of one logical camera that share a YUV size; the narrower-FOV one is "left".
+  Baseline/direction come from the reported lens pose and are converted into the camera frame using `SENSOR_ORIENTATION`.
+* **Stream sizes** come from the stream-configuration map. RAW is used only for Bayer sensors that advertise it; otherwise YUV.
+* **Timing**: if the camera clock is not `REALTIME`, the gyro/camera clock offset is estimated once per run (less precise; logged).
+* **Memory**: the 2× output region is a centred crop sized from the device's RAM (≤ ~24 MP out), so 50–200 MP sensors cannot exhaust memory.
+* Focus is auto-locked and exposure locked for the burst; OIS/video stabilisation/edge enhancement are switched off when the device allows.
 
-## User Interface & Experience
+## Stereo calibration file
 
-Designed for one-handed, thumb-reach use: every control sits in the bottom panel, every touch target is at least 44–48 dp, and the active mode is colour-coded (teal = Inspect, violet = 3D Scan, orange = Labs).
+Import via **Labs → import button** (or put `stereo_calibration.json` in `Android/data/<package>/files`). OpenCV `stereoCalibrate` conventions,
+camera 1 = the "left" camera named in the console, `X2 = R·X1 + T`:
 
-- **Undistorted live viewfinder** with framing reticle; the preview buffer is negotiated 4:3 so nothing is stretched.
-- **Stability badge**: gyroscope-driven `STEADY` / `HOLD STILL` pill that also recolours the reticle.
-- **Mode switcher** (`INSPECT`, `3D SCAN`, `LABS`) with a sliding highlight, haptic tick and disabled while a capture runs.
-- **One big shutter** that morphs into a stop button, shows burst progress as a ring, and gives haptic feedback. The screen stays awake while capturing.
-- **Before/after reveal**: drag the divider, pinch to zoom (up to 4×), double-tap to reset.
-- **3D scan**: live depth heat-map with near/far legend, elapsed timer, one-tap *Finish & build mesh*, then Share STL / Share PLY / Open / New scan.
-- **Labs**: standard vs. full-res streams, one-tap calibration-pair capture, mesh export, and an inline console that expands into a copyable log sheet.
-- **Guide sheet** explaining each mode and tips; Back always closes the topmost layer first.
-- **Direct sharing** of images and meshes through Android `FileProvider`.
-
----
-
-## Hardware Compatibility
-
-- **Target OS**: Android 10+ (API 29+, compiled with SDK 37).
-- **Camera Requirements**: Multi-camera hardware advertising `REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA` with independent physical stream routing.
-- **Privacy Assurance**: No internet or external communication permissions are requested or declared.
-
----
-
-## Building from Source
-
-Prerequisites:
-- JDK 17 or JDK 21
-- Android SDK Platform 37 (`platforms;android-37.0`) and Build-Tools `37.0.0`
-- Android NDK `26.1.10909125`
-- CMake `3.22.1`
-
-```bash
-# Clone the repository
-git clone https://github.com/Foadsf/android-multicam.git
-cd android-multicam
-
-# Configure local Android SDK path
-echo "sdk.dir=$ANDROID_HOME" > local.properties
-
-# Build debug APK
-./gradlew assembleDebug
-
-# Output APK:
-# app/build/outputs/apk/debug/app-debug.apk
+```json
+{ "image_size": [1440, 1080],
+  "K1": [[fx,0,cx],[0,fy,cy],[0,0,1]], "D1": [k1,k2,p1,p2,k3],
+  "K2": [[fx,0,cx],[0,fy,cy],[0,0,1]], "D2": [k1,k2,p1,p2,k3],
+  "R": [[1,0,0],[0,1,0],[0,0,1]], "T": [-18.5, 0, 0], "T_units": "mm" }
 ```
 
-Every merge to `main` is built by CI and published automatically as the rolling [`latest` release](../../releases/tag/latest) (`multicam-latest.apk`, debug-signed). Every push and PR also uploads the APK as a workflow artifact.
+## Verification
 
-Install via ADB:
+The computational core (`app/src/main/cpp/engine.hpp`) is pure C++ and is tested on a host against independently generated ground truth:
+
 ```bash
+./native-tests/run.sh      # needs g++; CI runs it on every push
+```
+
+It checks gyro-integration == rotation-vector-derived rotation for all sensor orientations; burst registration sign/magnitude and
+that the merged result beats a single frame (PSNR vs. ground truth) with and without gyro; RAW/sRGB exposure; memory-bounded ROI;
+marching-tetrahedra output is closed, consistently wound, outward and on the true surface (sphere); stereo depth error on planes at
+150/250/400 mm with horizontal and vertical baselines. **Not covered by automated tests:** Camera2 behaviour on real devices,
+sensor timestamps, UI rendering. Those need a phone; please report device results.
+
+## Building
+
+Prerequisites: JDK 17 or 21, Android SDK Platform 37 + Build-Tools 37.0.0, NDK 26.1.10909125, CMake 3.22.1.
+
+```bash
+git clone https://github.com/Foadsf/android-multicam.git && cd android-multicam
+echo "sdk.dir=$ANDROID_HOME" > local.properties
+./native-tests/run.sh          # optional: host tests
+./gradlew assembleDebug        # app/build/outputs/apk/debug/app-debug.apk (arm64-v8a, armeabi-v7a, x86_64)
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ```
 
----
+Every merge to `main` is built by CI and published as the rolling [`latest` release](../../releases/tag/latest) (debug-signed). Every push/PR also uploads the APK as a workflow artifact.
+
+## Outputs
+
+`Android/data/<package>/files/`: `macro_<time>.jpg` (2× result), `scan_<time>.stl|.ply` (millimetres), `left_NN.pgm`/`right_NN.pgm` (calibration pairs).
+Use the in-app **Share/Open** buttons — recent Android versions hide that folder from file managers.
+
+## Interface
+
+Thumb-reach layout: viewfinder in the middle, all controls in the bottom panel, ≥ 44–48 dp touch targets, per-mode accent colour, haptic feedback,
+screen kept awake while capturing, Back closes the top layer first. Portrait only for now (the viewfinder transform for landscape is not implemented).
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+[GNU General Public License v3.0](LICENSE).

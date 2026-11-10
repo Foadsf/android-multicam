@@ -1,698 +1,751 @@
 package com.example.multicamtest;
 
+import android.app.ActivityManager;
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.Color;
-import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
-import android.graphics.SurfaceTexture;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
-import android.hardware.camera2.*;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.BlackLevelPattern;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
-import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.util.Log;
+import android.util.Range;
 import android.util.Size;
-import android.util.SizeF;
 import android.view.Surface;
-import org.json.JSONArray;
-import org.json.JSONObject;
+
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Camera2 + Sensor engine managing live preview, gyro-aligned macro super-resolution bursts,
- * and dual physical camera synchronous stereo depth estimation.
+ * Camera2 + sensor orchestration. All camera/lens/size decisions come from {@link CameraTopology}
+ * (documented metadata only); all maths lives in the native engine.
+ *
+ * <p>Threads: {@code cameraThread} runs Camera2 callbacks and state changes; {@code workThread} receives
+ * ImageReader frames and runs the native processing so heavy work never blocks camera callbacks.
  */
 public final class CaptureEngine {
     public interface Listener {
-        void onState(String message, int color);
+        int LEVEL_INFO = 0, LEVEL_BUSY = 1, LEVEL_OK = 2, LEVEL_ERROR = 3;
+        void onState(String message, int level);
         void onProgress(int value, int max);
         void onLog(String line);
         void onStability(float stability);
-        void onImage(Bitmap bitmap);
-        void onMacroResult(Bitmap before, Bitmap after, File file);
+        void onDepthFrame(Bitmap bitmap);
+        void onMacroResult(Bitmap before, Bitmap after, File file, int outWidth, int outHeight);
         void onScanResult(File stlFile, File plyFile, int triangleCount);
+        void onStereoInfo(float baselineMm, float zMinMm, float zMaxMm, String calibration);
+        void onCapabilities(boolean stereo, boolean raw);
     }
 
-    private static final String TAG = "MultiCamTest";
-    private static final String DEFAULT_LOGICAL_ID = "20", FALLBACK_LOGICAL_ID = "23";
-    private static final String PHYS_ID_WIDE = "0", PHYS_ID_UW = "2";
+    private static final String TAG = "MultiCam";
     public static final int MICROSCOPE_BURST_FRAMES = 20;
+    private static final long FOCUS_TIMEOUT_MS = 3000;
+    private static final int SETTLE_FRAMES_AFTER_LOCK = 3;
 
     private final Context ctx;
     private final Listener listener;
+    private final CameraTopology topo;
 
-    private final HandlerThread cameraThread;
-    private final Handler cameraHandler;
+    private final HandlerThread cameraThread = new HandlerThread("mc-camera"), workThread = new HandlerThread("mc-work");
+    private final Handler cameraHandler, workHandler;
     private final Executor cameraExecutor;
-
-    /** Sensor mounting angle of the wide camera; used only to rotate display bitmaps upright. */
-    private int sensorOrientation = 90;
+    private final ExecutorService finishExecutor = Executors.newSingleThreadExecutor(r -> new Thread(r, "mc-finish"));
 
     private SensorManager sensorManager;
     private Sensor gyroSensor;
-    private float currentStability = 1.0f;
+    private volatile float stability = 1.0f;
+    private long lastStabilityEmit;
+    private boolean sensorsActive;
 
+    // --- camera state (touched on cameraThread, except where noted) ---
     private Surface previewSurface;
-    private boolean isPreviewActive = false;
-    private boolean isBusyCapturing = false;
-
+    private boolean busy;
     private CameraDevice cameraDevice;
-    private CameraCaptureSession activeSession;
+    private CameraCaptureSession session;
     private ImageReader reader0, reader2;
-    private int width0 = 1440, height0 = 1080, width2 = 1440, height2 = 1080;
 
-    private final AtomicInteger frameCount0 = new AtomicInteger(0), frameCount2 = new AtomicInteger(0);
-    private final AtomicBoolean saveNextCalibrationPair = new AtomicBoolean(false);
-    private final AtomicInteger calibrationPairCounter = new AtomicInteger(0);
+    // --- work-thread state, guarded by procLock; runId invalidates in-flight frames of a finished run ---
+    private final Object procLock = new Object();
+    private int runId;
+    private int sensorOrientation = 90;
+    private boolean timeOffsetKnown;
+    private boolean cameraClockRealtime = true;
 
-    private Bitmap baselineBeforeBitmap = null;
+    // macro
+    private volatile boolean macroAccepting;
+    private volatile int macroSettle;
+    private final AtomicBoolean macroFinishing = new AtomicBoolean(false);
+    private int[] macroOut;
+    private boolean focusDone, aeDone, locked;
+    private long focusStartMs;
 
-    private static final class FrameSlot {
-        long timestampNs; int width, height, rowStride; ByteBuffer directY;
-    }
-
-    private final Object stereoSyncLock = new Object();
-    private FrameSlot latestSlot0, latestSlot2;
-    private int[] heatmapPixels;
-
-    private final SensorEventListener gyroListener = new SensorEventListener() {
-        @Override
-        public void onSensorChanged(SensorEvent event) {
-            float gx = event.values[0], gy = event.values[1], gz = event.values[2];
-            float omega = (float) Math.sqrt(gx * gx + gy * gy + gz * gz);
-            float inst = Math.max(0.0f, Math.min(1.0f, 1.0f - (omega / 0.35f)));
-            currentStability = 0.85f * currentStability + 0.15f * inst;
-            listener.onStability(currentStability);
-        }
-        @Override
-        public void onAccuracyChanged(Sensor sensor, int accuracy) {}
-    };
+    // stereo
+    private int stW, stH;
+    private int[] heatmap;
+    private float[] stereoInfo;
+    private long pairSyncNs = 6_000_000L;
+    private final AtomicBoolean saveNextPair = new AtomicBoolean(false);
+    private int pairCounter, pairFramesLogged;
+    private long lastDepthEmitMs;
+    private static final class Slot { long ts; int w, h, stride; ByteBuffer y; boolean fresh; }
+    private final Slot slotL = new Slot(), slotR = new Slot();
 
     public CaptureEngine(Context context, Listener l) {
         ctx = context.getApplicationContext();
         listener = l;
-        cameraThread = new HandlerThread("CameraBackgroundThread");
-        cameraThread.start();
+        topo = CameraTopology.get(ctx);
+        cameraThread.start(); workThread.start();
         cameraHandler = new Handler(cameraThread.getLooper());
+        workHandler = new Handler(workThread.getLooper());
         cameraExecutor = cameraHandler::post;
 
         sensorManager = (SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
-        if (sensorManager != null) {
-            gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
-            if (gyroSensor != null) {
-                sensorManager.registerListener(gyroListener, gyroSensor, SensorManager.SENSOR_DELAY_UI, cameraHandler);
-            }
-        }
+        if (sensorManager != null) gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
 
-        try {
-            CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
-            Integer so = cm.getCameraCharacteristics(PHYS_ID_WIDE).get(CameraCharacteristics.SENSOR_ORIENTATION);
-            if (so != null) sensorOrientation = so;
-        } catch (Exception e) { Log.w(TAG, "Sensor orientation lookup failed", e); }
-
-        NativeEngine.startImuLooper();
+        sensorOrientation = topo.macro != null ? topo.macro.sensorOrientation : 90;
+        NativeEngine.startImuLooper(ctx.getPackageName(), sensorOrientation);
+        for (String n : topo.notes) listener.onLog(n);
+        listener.onCapabilities(topo.stereo != null, topo.macro != null && topo.macro.supportsRaw16());
+        if (gyroSensor == null) listener.onLog("No gyroscope: stability meter disabled, registration relies on image alignment only.");
     }
 
-    /**
-     * Largest 4:3 SurfaceTexture size of the wide camera not exceeding ~2 MP (falls back to 1440x1080).
-     * The viewfinder is laid out with this aspect ratio so the live preview is never stretched.
-     */
-    public static Size choosePreviewSize(Context context) {
-        Size best = new Size(1440, 1080);
-        try {
-            CameraManager cm = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-            StreamConfigurationMap map = cm.getCameraCharacteristics(PHYS_ID_WIDE).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            Size[] sizes = map != null ? map.getOutputSizes(SurfaceTexture.class) : null;
-            long bestArea = 0;
-            if (sizes != null) {
-                for (Size sz : sizes) {
-                    long area = (long) sz.getWidth() * sz.getHeight();
-                    boolean fourThree = Math.abs(sz.getWidth() * 3 - sz.getHeight() * 4) <= 8;
-                    if (fourThree && area <= 2_100_000L && area > bestArea) { best = sz; bestArea = area; }
-                }
-            }
-        } catch (Exception e) { Log.w(TAG, "Preview size negotiation fallback", e); }
-        return best;
-    }
+    // ------------------------------------------------------------------------------------------
+    // lifecycle / public API
+    // ------------------------------------------------------------------------------------------
 
-    /** Rotate a sensor-oriented bitmap so it appears upright when the phone is held in portrait. */
-    private Bitmap upright(Bitmap src) {
-        if (src == null || sensorOrientation == 0) return src;
-        Matrix m = new Matrix();
-        m.postRotate(sensorOrientation);
-        return Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, true);
+    /** Register motion sensors only while the UI is visible. */
+    public void setActive(boolean active) {
+        cameraExecutor.execute(() -> {
+            if (active == sensorsActive || sensorManager == null) return;
+            sensorsActive = active;
+            if (active && gyroSensor != null) sensorManager.registerListener(gyroListener, gyroSensor, SensorManager.SENSOR_DELAY_UI, cameraHandler);
+            else sensorManager.unregisterListener(gyroListener);
+        });
     }
 
     public File outputDir() { return ctx.getExternalFilesDir(null); }
 
     public void setPreviewSurface(Surface surface) {
         cameraExecutor.execute(() -> {
-            this.previewSurface = surface;
-            if (surface != null && surface.isValid() && !isBusyCapturing) {
-                startLivePreview();
-            } else if (surface == null && isPreviewActive) {
-                stopLivePreview();
-            }
+            previewSurface = surface;
+            if (surface != null && surface.isValid() && !busy) startLivePreview();
+            else if (surface == null) cleanupCamera();
         });
     }
 
     public void resumePreview() {
         cameraExecutor.execute(() -> {
-            isBusyCapturing = false;
-            if (previewSurface != null && previewSurface.isValid()) {
-                startLivePreview();
-            }
+            busy = false;
+            if (previewSurface != null && previewSurface.isValid()) startLivePreview();
         });
     }
 
-    public void startScan(boolean fullRes) {
-        cameraExecutor.execute(() -> {
-            isBusyCapturing = true;
-            startDualCameraScannerMode(DEFAULT_LOGICAL_ID, fullRes);
-        });
-    }
-
-    public void startMacro(boolean raw) {
-        cameraExecutor.execute(() -> {
-            isBusyCapturing = true;
-            startMicroscopeMode(raw);
-        });
-    }
+    public void startScan(boolean fullRes) { cameraExecutor.execute(() -> { busy = true; startStereo(fullRes); }); }
+    public void startMacro(boolean raw) { cameraExecutor.execute(() -> { busy = true; startMacroBurst(raw); }); }
 
     public void stop() {
         cameraExecutor.execute(() -> {
             cleanupCamera();
-            isBusyCapturing = false;
-            if (previewSurface != null && previewSurface.isValid()) {
-                startLivePreview();
-            }
+            busy = false;
+            if (previewSurface != null && previewSurface.isValid()) startLivePreview();
         });
     }
 
-    public void savePair() {
-        saveNextCalibrationPair.set(true);
-        setState("Saving next synchronized pair...", Color.rgb(255, 213, 79));
+    /** Stops everything and releases the camera (called when the UI goes to the background). */
+    public void pause() {
+        cameraExecutor.execute(() -> { cleanupCamera(); busy = false; });
+        setActive(false);
     }
 
+    public void savePair() {
+        saveNextPair.set(true);
+        listener.onState("Saving next synchronised pair…", Listener.LEVEL_BUSY);
+    }
+
+    /** Builds and exports the mesh. Blocking: call from a background thread. */
     public int exportMesh() {
-        File dir = ctx.getExternalFilesDir(null);
-        if (dir == null) return -1;
-        File stl = new File(dir, "scan_mesh.stl"), ply = new File(dir, "scan_mesh.ply");
+        File dir = outputDir();
+        if (dir == null) { listener.onState("Storage unavailable.", Listener.LEVEL_ERROR); return -1; }
+        String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        File stl = new File(dir, "scan_" + stamp + ".stl"), ply = new File(dir, "scan_" + stamp + ".ply");
         int tris = NativeEngine.exportStereoMesh(stl.getAbsolutePath(), ply.getAbsolutePath());
-        appendStatus("Mesh exported -> " + stl.getAbsolutePath() + " (" + tris + " triangles)");
-        listener.onScanResult(stl, ply, tris);
+        listener.onLog(tris > 0 ? "Mesh exported: " + stl.getName() + " (" + tris + " triangles)" : "Mesh export produced no surface.");
+        listener.onScanResult(tris > 0 ? stl : null, tris > 0 ? ply : null, tris);
         return tris;
     }
 
     public void release() {
-        if (sensorManager != null) {
-            sensorManager.unregisterListener(gyroListener);
-        }
-        cleanupCamera();
+        setActive(false);
+        cameraExecutor.execute(this::cleanupCamera);
         NativeEngine.stopImuLooper();
+        NativeEngine.releaseMicroscope();
+        finishExecutor.shutdown();
         cameraThread.quitSafely();
+        workThread.quitSafely();
     }
 
-    private void setState(String s, int color) { listener.onState(s, color); }
-    private void setProgress(int v, int max) { listener.onProgress(v, max); }
-    private void appendStatus(String msg) { listener.onLog(msg); }
+    private final SensorEventListener gyroListener = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent e) {
+            float omega = (float) Math.sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2]);
+            float inst = Math.max(0f, Math.min(1f, 1f - omega / 0.35f));  // 0.35 rad/s (~20 deg/s) = unusable
+            float prev = stability;
+            stability = 0.8f * prev + 0.2f * inst;
+            long now = SystemClock.elapsedRealtime();
+            if (Math.abs(stability - prev) > 0.03f || now - lastStabilityEmit > 250) { lastStabilityEmit = now; listener.onStability(stability); }
+        }
+        @Override public void onAccuracyChanged(Sensor s, int a) {}
+    };
+
+    private void setState(String s, int level) { listener.onState(s, level); }
+    private void log(String s) { Log.i(TAG, s); listener.onLog(s); }
+    private boolean previewStarting;  // a failed preview must not restart itself forever
+
+    private void fail(String message) {
+        Log.e(TAG, message);
+        final boolean wasPreview = previewStarting;
+        previewStarting = false;
+        busy = false;
+        cleanupCamera();
+        listener.onProgress(0, 0);
+        setState(message, Listener.LEVEL_ERROR);
+        if (!wasPreview && previewSurface != null && previewSurface.isValid()) startLivePreview();
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // open + session with fallback plans
+    // ------------------------------------------------------------------------------------------
+
+    private interface SessionReady { void onReady(CameraDevice dev, CameraCaptureSession s); }
+
+    private static final class Plan { final String id; final boolean routed; Plan(String id, boolean routed) { this.id = id; this.routed = routed; } }
+
+    private List<Plan> plansFor(CameraTopology.Cam cam) {
+        List<Plan> p = new ArrayList<>();
+        if (cam.physicalId == null) { p.add(new Plan(cam.openId, false)); return p; }
+        if (cam.directId != null) p.add(new Plan(cam.directId, false));  // plain open of a framework-listed physical id
+        p.add(new Plan(cam.openId, true));                               // logical camera + physical stream routing
+        return p;
+    }
+
+    /** Opens {@code cam}, creates a session over {@code surfaces}, trying each open plan until one configures. */
+    private void openSession(CameraTopology.Cam cam, List<Surface> surfaces, SessionReady ready) {
+        tryPlan(cam, plansFor(cam), 0, surfaces, ready, "");
+    }
+
+    private void tryPlan(CameraTopology.Cam cam, List<Plan> plans, int i, List<Surface> surfaces, SessionReady ready, String lastError) {
+        if (i >= plans.size()) { fail("Camera unavailable" + (lastError.isEmpty() ? "." : ": " + lastError)); return; }
+        final Plan plan = plans.get(i);
+        CameraManager manager = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+        final int myRun;
+        synchronized (procLock) { myRun = runId; }
+        try {
+            manager.openCamera(plan.id, cameraExecutor, new CameraDevice.StateCallback() {
+                private boolean handled;
+                private void next(String why) {
+                    if (handled) return;
+                    handled = true;
+                    if (!isCurrent(myRun)) return;
+                    closeDeviceOnly();
+                    tryPlan(cam, plans, i + 1, surfaces, ready, why);
+                }
+                @Override public void onOpened(CameraDevice dev) {
+                    if (!isCurrent(myRun)) { dev.close(); return; }
+                    cameraDevice = dev;
+                    try {
+                        List<OutputConfiguration> outs = new ArrayList<>();
+                        for (Surface s : surfaces) {
+                            OutputConfiguration oc = new OutputConfiguration(s);
+                            if (plan.routed) oc.setPhysicalCameraId(cam.physicalId);
+                            outs.add(oc);
+                        }
+                        dev.createCaptureSession(new SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outs, cameraExecutor,
+                            new CameraCaptureSession.StateCallback() {
+                                @Override public void onConfigured(CameraCaptureSession s) {
+                                    if (!isCurrent(myRun)) { s.close(); return; }
+                                    session = s; handled = true;
+                                    ready.onReady(dev, s);
+                                }
+                                @Override public void onConfigureFailed(CameraCaptureSession s) {
+                                    next("session configuration failed on " + plan.id + (plan.routed ? " (routed)" : ""));
+                                }
+                            }));
+                    } catch (Exception e) { next(e.getClass().getSimpleName() + ": " + e.getMessage()); }
+                }
+                @Override public void onDisconnected(CameraDevice dev) { dev.close(); if (cameraDevice == dev) cameraDevice = null; next("camera disconnected"); }
+                @Override public void onError(CameraDevice dev, int err) { dev.close(); if (cameraDevice == dev) cameraDevice = null; next("camera error " + err); }
+            });
+        } catch (SecurityException e) {
+            fail("Camera permission denied.");
+        } catch (Exception e) {
+            tryPlan(cam, plans, i + 1, surfaces, ready, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        }
+    }
+
+    private boolean isCurrent(int id) { synchronized (procLock) { return id == runId; } }
+
+    private void closeDeviceOnly() {
+        if (session != null) { try { session.close(); } catch (Exception ignored) {} session = null; }
+        if (cameraDevice != null) { try { cameraDevice.close(); } catch (Exception ignored) {} cameraDevice = null; }
+    }
+
+    /** Closes everything and invalidates frames still in flight. Waits for an in-progress frame to finish. */
+    private void cleanupCamera() {
+        synchronized (procLock) {
+            runId++;
+            macroAccepting = false;
+            closeDeviceOnly();
+            if (reader0 != null) { try { reader0.close(); } catch (Exception ignored) {} reader0 = null; }
+            if (reader2 != null) { try { reader2.close(); } catch (Exception ignored) {} reader2 = null; }
+            slotL.fresh = slotR.fresh = false;
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // live preview
+    // ------------------------------------------------------------------------------------------
 
     private void startLivePreview() {
-        if (previewSurface == null || !previewSurface.isValid()) return;
+        if (previewSurface == null || !previewSurface.isValid() || topo.macro == null) return;
         cleanupCamera();
-        CameraManager manager = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
-        try {
-            manager.openCamera(PHYS_ID_WIDE, cameraExecutor, new CameraDevice.StateCallback() {
-                @Override
-                public void onOpened(CameraDevice camera) {
-                    cameraDevice = camera;
-                    try {
-                        OutputConfiguration outConf = new OutputConfiguration(previewSurface);
-                        SessionConfiguration sc = new SessionConfiguration(
-                            SessionConfiguration.SESSION_REGULAR,
-                            Arrays.asList(outConf),
-                            cameraExecutor,
-                            new CameraCaptureSession.StateCallback() {
-                                @Override
-                                public void onConfigured(CameraCaptureSession session) {
-                                    activeSession = session;
-                                    isPreviewActive = true;
-                                    try {
-                                        CaptureRequest.Builder b = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                                        b.addTarget(previewSurface);
-                                        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
-                                        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-                                        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-                                        session.setRepeatingRequest(b.build(), null, cameraHandler);
-                                        setState("Viewfinder Ready - Align subject.", Color.rgb(0, 230, 118));
-                                    } catch (CameraAccessException e) {
-                                        Log.e(TAG, "Preview request failed", e);
-                                    }
-                                }
+        final Surface target = previewSurface;
+        final CameraTopology.Cam cam = topo.macro;
+        previewStarting = true;
+        openSession(cam, java.util.Collections.singletonList(target), (dev, s) -> {
+            try {
+                CaptureRequest.Builder b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                b.addTarget(target);
+                b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+                if (has(cam.chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES), CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE))
+                    b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                s.setRepeatingRequest(b.build(), null, cameraHandler);
+                previewStarting = false;
+                setState("Ready — frame your subject.", Listener.LEVEL_OK);
+            } catch (Exception e) { fail("Preview failed: " + e.getMessage()); }
+        });
+    }
 
-                                @Override
-                                public void onConfigureFailed(CameraCaptureSession session) {
-                                    Log.e(TAG, "Preview session configure failed");
-                                    isPreviewActive = false;
-                                }
-                            }
-                        );
-                        camera.createCaptureSession(sc);
-                    } catch (CameraAccessException e) {
-                        Log.e(TAG, "Preview session creation failed", e);
+    // ------------------------------------------------------------------------------------------
+    // macro burst
+    // ------------------------------------------------------------------------------------------
+
+    private static boolean has(int[] arr, int v) { if (arr != null) for (int a : arr) if (a == v) return true; return false; }
+
+    private static Size largest(Size[] sizes, double maxPixels) {
+        Size best = null;
+        for (Size s : sizes) {
+            double a = (double) s.getWidth() * s.getHeight();
+            if (a <= maxPixels && (best == null || a > (double) best.getWidth() * best.getHeight())) best = s;
+        }
+        return best;
+    }
+
+    private float outputBudgetMegapixels() {
+        ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+        ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+        am.getMemoryInfo(mi);
+        // ~10 float planes (4 B) live at the peak of reconstruction; keep that under ~10% of total RAM.
+        double mp = mi.totalMem * 0.10 / 40.0 / 1e6;
+        return (float) Math.max(6.0, Math.min(24.0, mp));
+    }
+
+    private void startMacroBurst(boolean wantRaw) {
+        cleanupCamera();
+        final CameraTopology.Cam cam = topo.macro;
+        if (cam == null) { fail("No back camera found."); return; }
+        final boolean raw = wantRaw && cam.supportsRaw16();
+        if (wantRaw && !raw) log("RAW16 not available on " + cam.label() + " — using processed frames.");
+        Size size = raw ? largest(cam.sizes(ImageFormat.RAW_SENSOR), 1e9) : largest(cam.sizes(ImageFormat.YUV_420_888), 20e6);
+        if (size == null) { fail("The camera offers no suitable capture size."); return; }
+        final int w = size.getWidth(), h = size.getHeight();
+
+        sensorOrientation = cam.sensorOrientation;
+        NativeEngine.setSensorOrientation(sensorOrientation);
+        Integer ts = cam.chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+        cameraClockRealtime = ts != null && ts == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+        timeOffsetKnown = false;
+        NativeEngine.setImuTimeOffsetNs(0);
+        if (!cameraClockRealtime) log("Camera clock is not REALTIME: gyro alignment uses an estimated clock offset (less precise).");
+
+        float fx, fy;
+        float[] k = cam.chars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION);
+        android.graphics.Rect arr = cam.chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
+        if (arr == null) arr = cam.chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        float scale = arr != null && arr.width() > 0 ? (float) w / arr.width() : 1f;
+        if (k != null && k.length >= 2 && k[0] > 0) { fx = k[0] * scale; fy = k[1] * scale; }
+        else if (cam.sensorMm != null && cam.sensorMm.getWidth() > 0 && cam.focalMm > 0) { fx = fy = cam.focalMm / cam.sensorMm.getWidth() * w; }
+        else { fx = fy = 0.8f * w; }
+        Integer cfa = cam.chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
+        Integer white = cam.chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+        BlackLevelPattern blp = cam.chars.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+        int black = 0;
+        if (blp != null) black = (blp.getOffsetForIndex(0, 0) + blp.getOffsetForIndex(1, 0) + blp.getOffsetForIndex(0, 1) + blp.getOffsetForIndex(1, 1)) / 4;
+        NativeEngine.configureMicroscope(fx, fy, cfa != null ? cfa : 0, black, white != null ? white : 1023);
+        macroOut = NativeEngine.resetMicroscope(w, h, outputBudgetMegapixels());
+        macroFinishing.set(false);
+        macroAccepting = false;
+        macroSettle = SETTLE_FRAMES_AFTER_LOCK;
+        log(String.format(Locale.US, "Macro burst: %s %dx%d on %s → processing a %dx%d output region", raw ? "RAW16" : "YUV", w, h, cam.label(), macroOut[0], macroOut[1]));
+        setState("Focusing…", Listener.LEVEL_BUSY);
+        listener.onProgress(0, MICROSCOPE_BURST_FRAMES);
+
+        final int fmt = raw ? ImageFormat.RAW_SENSOR : ImageFormat.YUV_420_888;
+        final int myRun;
+        synchronized (procLock) { myRun = runId; }
+        reader0 = ImageReader.newInstance(w, h, fmt, 4);
+        reader0.setOnImageAvailableListener(r -> onMacroImage(r, myRun, raw), workHandler);
+
+        openSession(cam, java.util.Collections.singletonList(reader0.getSurface()), (dev, s) -> startMacroRequests(cam, dev, s));
+    }
+
+    private void startMacroRequests(CameraTopology.Cam cam, CameraDevice dev, CameraCaptureSession s) {
+        try {
+            focusDone = aeDone = locked = false;
+            focusStartMs = SystemClock.elapsedRealtime();
+            final boolean af = has(cam.chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES), CameraMetadata.CONTROL_AF_MODE_AUTO) && cam.minFocusDiopters > 0;
+            final boolean aeLockOk = Boolean.TRUE.equals(cam.chars.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE));
+            final Surface target = reader0.getSurface();
+            if (!af) focusDone = true;
+
+            CaptureRequest.Builder b = macroBuilder(cam, dev, target, af, false);
+            CameraCaptureSession.CaptureCallback cb = new CameraCaptureSession.CaptureCallback() {
+                @Override public void onCaptureCompleted(CameraCaptureSession sess, CaptureRequest req, TotalCaptureResult res) {
+                    if (locked) {
+                        int left = macroSettle;
+                        if (left > 0) {
+                            macroSettle = left - 1;
+                            if (left == 1) { macroAccepting = true; setState("Hold steady — capturing…", Listener.LEVEL_BUSY); }
+                        }
+                        return;
+                    }
+                    Integer afs = res.get(CaptureResult.CONTROL_AF_STATE), aes = res.get(CaptureResult.CONTROL_AE_STATE);
+                    if (af && afs != null && (afs == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED || afs == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED)) focusDone = true;
+                    if (aes == null || aes == CaptureResult.CONTROL_AE_STATE_CONVERGED || aes == CaptureResult.CONTROL_AE_STATE_LOCKED || aes == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED) aeDone = true;
+                    boolean timeout = SystemClock.elapsedRealtime() - focusStartMs > FOCUS_TIMEOUT_MS;
+                    if ((focusDone && aeDone) || timeout) {
+                        locked = true;
+                        if (!(focusDone && aeDone)) log("Focus/exposure did not settle in time; capturing anyway.");
+                        try {
+                            CaptureRequest.Builder lb = macroBuilder(cam, dev, target, af, aeLockOk);
+                            sess.setRepeatingRequest(lb.build(), this, cameraHandler);
+                        } catch (Exception e) { fail("Camera request failed: " + e.getMessage()); }
                     }
                 }
+            };
+            if (af) {
+                CaptureRequest.Builder t = macroBuilder(cam, dev, target, true, false);
+                t.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+                s.capture(t.build(), cb, cameraHandler);
+            }
+            s.setRepeatingRequest(b.build(), cb, cameraHandler);
+        } catch (Exception e) { fail("Camera request failed: " + e.getMessage()); }
+    }
 
-                @Override
-                public void onDisconnected(CameraDevice camera) {
-                    cleanupCamera();
-                    isPreviewActive = false;
-                }
+    private CaptureRequest.Builder macroBuilder(CameraTopology.Cam cam, CameraDevice dev, Surface target, boolean af, boolean aeLock) throws CameraAccessException {
+        CaptureRequest.Builder b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+        b.addTarget(target);
+        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        if (aeLock) b.set(CaptureRequest.CONTROL_AE_LOCK, true);  // constant exposure across the burst
+        if (af) b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+        else {
+            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+            if (cam.minFocusDiopters > 0) b.set(CaptureRequest.LENS_FOCUS_DISTANCE, Math.min(cam.minFocusDiopters, 10f));
+        }
+        // Shortest exposures: the highest frame-rate range (<= 60 fps) the device offers.
+        Range<Integer>[] ranges = cam.chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges != null && ranges.length > 0) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestRangeAtMost(ranges, 60));
+        // Stabilisation and ISP sharpening move/alter pixels in ways the registration model does not know about.
+        if (has(cam.chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION), CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF))
+            b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF);
+        if (has(cam.chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES), CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF))
+            b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+        if (has(cam.chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES), CameraMetadata.EDGE_MODE_OFF))
+            b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF);
+        int[] nr = cam.chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES);
+        if (has(nr, CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL)) b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL);
+        else if (has(nr, CameraMetadata.NOISE_REDUCTION_MODE_OFF)) b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF);
+        return b;
+    }
 
-                @Override
-                public void onError(CameraDevice camera, int error) {
-                    cleanupCamera();
-                    isPreviewActive = false;
+    private static Range<Integer> bestRangeAtMost(Range<Integer>[] ranges, int maxFps) {
+        Range<Integer> best = null;
+        for (Range<Integer> r : ranges) {
+            if (r.getUpper() > maxFps) continue;
+            if (best == null || r.getUpper() > best.getUpper() || (r.getUpper().equals(best.getUpper()) && r.getLower() > best.getLower())) best = r;
+        }
+        return best != null ? best : ranges[0];
+    }
+
+    private void onMacroImage(ImageReader r, int myRun, boolean raw) {
+        Image img;
+        try { img = r.acquireLatestImage(); } catch (Exception e) { return; }  // reader closed under us
+        if (img == null) return;
+        try {
+            synchronized (procLock) {
+                if (myRun != runId || !macroAccepting || macroFinishing.get()) return;
+                if (!cameraClockRealtime && !timeOffsetKnown) {  // UNKNOWN timestamp source: pin to elapsedRealtime once
+                    NativeEngine.setImuTimeOffsetNs(SystemClock.elapsedRealtimeNanos() - img.getTimestamp());
+                    timeOffsetKnown = true;
                 }
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "Error starting live preview", e);
+                long ts = img.getTimestamp(); int w = img.getWidth(), h = img.getHeight(), acc;
+                if (raw) {
+                    Image.Plane p = img.getPlanes()[0];
+                    acc = NativeEngine.pushMicroscopeRaw16Frame(p.getBuffer(), p.getRowStride(), w, h, ts);
+                } else {
+                    Image.Plane py = img.getPlanes()[0], pu = img.getPlanes()[1], pv = img.getPlanes()[2];
+                    acc = NativeEngine.pushMicroscopeYuvFrame(py.getBuffer(), py.getRowStride(), pu.getBuffer(), pu.getRowStride(), pu.getPixelStride(),
+                        pv.getBuffer(), pv.getRowStride(), pv.getPixelStride(), w, h, ts);
+                }
+                if (acc < 0) { cameraExecutor.execute(() -> fail("Frame rejected by the engine (size mismatch).")); return; }
+                listener.onProgress(acc, MICROSCOPE_BURST_FRAMES);
+                setState("Aligning frame " + acc + " of " + MICROSCOPE_BURST_FRAMES + " — hold steady", Listener.LEVEL_BUSY);
+                if (acc >= MICROSCOPE_BURST_FRAMES && macroFinishing.compareAndSet(false, true)) {
+                    macroAccepting = false;
+                    cameraExecutor.execute(() -> { cleanupCamera(); finishExecutor.execute(this::finishMacro); });
+                }
+            }
+        } finally {
+            img.close();
         }
     }
 
-    private void stopLivePreview() {
-        cleanupCamera();
-        isPreviewActive = false;
-    }
-
-    private void configureStereoCalibration(CameraManager manager, int streamW, int streamH) {
-        float fx0 = 0.762f * streamW, fy0 = 0.762f * streamW, cx0 = 0.5f * streamW, cy0 = 0.5f * streamH;
-        float fx2 = 0.391f * streamW, fy2 = 0.391f * streamW, cx2 = 0.5f * streamW, cy2 = 0.5f * streamH;
-        float[] d0 = new float[5], d2 = new float[5], R = new float[]{1f,0f,0f, 0f,1f,0f, 0f,0f,1f}, T_mm = new float[]{-18.5f, 0f, 0f};
+    private void finishMacro() {
+        setState("Reconstructing 2× image…", Listener.LEVEL_BUSY);
+        listener.onProgress(0, 0);
+        Bitmap full = null;
         try {
-            CameraCharacteristics c0 = manager.getCameraCharacteristics(PHYS_ID_WIDE);
-            float[] f0 = c0.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
-            SizeF s0 = c0.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
-            if (f0 != null && f0.length > 0 && s0 != null && s0.getWidth() > 0) {
-                fx0 = streamW * (f0[0] / s0.getWidth()); fy0 = streamH * (f0[0] / s0.getHeight());
-            }
-            CameraCharacteristics c2 = manager.getCameraCharacteristics(PHYS_ID_UW);
-            float[] f2 = c2.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
-            SizeF s2 = c2.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
-            if (f2 != null && f2.length > 0 && s2 != null && s2.getWidth() > 0) {
-                fx2 = streamW * (f2[0] / s2.getWidth()); fy2 = streamH * (f2[0] / s2.getHeight());
-            }
-        } catch (Exception e) { Log.w(TAG, "Physical focal lookup fallback", e); }
+            if (!NativeEngine.finalizeMicroscope()) { failFromWorker("Reconstruction failed."); return; }
+            int ow = macroOut[0], oh = macroOut[1];
+            full = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888);
+            if (!NativeEngine.exportMicroscopeToBitmap(full)) { failFromWorker("Could not read the reconstructed image."); return; }
+            int[] bs = NativeEngine.baselineSize();
+            Bitmap base = Bitmap.createBitmap(bs[0], bs[1], Bitmap.Config.ARGB_8888);
+            boolean haveBase = NativeEngine.exportBaselineToBitmap(base);
+            NativeEngine.releaseMicroscope();  // free native planes before encoding
 
-        File cf = new File(ctx.getExternalFilesDir(null), "stereo_calibration.json");
-        if (cf.exists()) {
-            try (FileInputStream fis = new FileInputStream(cf)) {
-                byte[] data = new byte[(int) cf.length()]; int n = fis.read(data);
-                if (n > 0) {
-                    JSONObject obj = new JSONObject(new String(data, 0, n, StandardCharsets.UTF_8));
-                    JSONArray k1 = obj.getJSONArray("K1"), k2 = obj.getJSONArray("K2");
-                    fx0 = (float) k1.getJSONArray(0).getDouble(0); cx0 = (float) k1.getJSONArray(0).getDouble(2);
-                    fy0 = (float) k1.getJSONArray(1).getDouble(1); cy0 = (float) k1.getJSONArray(1).getDouble(2);
-                    fx2 = (float) k2.getJSONArray(0).getDouble(0); cx2 = (float) k2.getJSONArray(0).getDouble(2);
-                    fy2 = (float) k2.getJSONArray(1).getDouble(1); cy2 = (float) k2.getJSONArray(1).getDouble(2);
-                    JSONArray d1J = obj.getJSONArray("D1"), d2J = obj.getJSONArray("D2");
-                    for (int i = 0; i < Math.min(5, d1J.length()); ++i)
-                        d0[i] = (float) (d1J.optJSONArray(i) != null ? d1J.getJSONArray(i).getDouble(0) : d1J.getDouble(i));
-                    for (int i = 0; i < Math.min(5, d2J.length()); ++i)
-                        d2[i] = (float) (d2J.optJSONArray(i) != null ? d2J.getJSONArray(i).getDouble(0) : d2J.getDouble(i));
-                    JSONArray rJ = obj.getJSONArray("R"), tJ = obj.getJSONArray("T");
-                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) R[r * 3 + c] = (float) rJ.getJSONArray(r).getDouble(c);
-                    for (int i = 0; i < 3; ++i) {
-                        double v = tJ.optJSONArray(i) != null ? tJ.getJSONArray(i).getDouble(0) : tJ.getDouble(i);
-                        T_mm[i] = (float) (Math.abs(v) < 1.0 ? v * 1000.0 : v);
-                    }
-                    appendStatus("Loaded stereo_calibration.json");
-                }
-            } catch (Exception e) { Log.e(TAG, "Failed parsing stereo_calibration.json", e); }
+            File dir = outputDir();
+            File out = new File(dir, "macro_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".jpg");
+            try (FileOutputStream fos = new FileOutputStream(out)) {
+                if (!full.compress(Bitmap.CompressFormat.JPEG, 95, fos)) throw new java.io.IOException("JPEG encoder failed");
+            }
+            // Both previews at the same displayed size so the divider compares like with like.
+            float sc = Math.min(1f, 2200f / Math.max(ow, oh));
+            int pw = Math.max(1, Math.round(ow * sc)), ph = Math.max(1, Math.round(oh * sc));
+            Bitmap after = Bitmap.createScaledBitmap(full, pw, ph, true);
+            Bitmap before = haveBase ? Bitmap.createScaledBitmap(base, pw, ph, true) : after;
+            base.recycle();
+            full.recycle(); full = null;
+            log("Saved " + out.getName() + " (" + ow + "×" + oh + ", " + (out.length() / 1024) + " kB)");
+            setState("2× super-resolution ready.", Listener.LEVEL_OK);
+            listener.onMacroResult(upright(before), upright(after), out, ow, oh);
+        } catch (Throwable t) {
+            Log.e(TAG, "macro finish failed", t);
+            failFromWorker("Reconstruction failed: " + (t instanceof OutOfMemoryError ? "not enough memory" : t.getMessage()));
+        } finally {
+            if (full != null) full.recycle();
+            NativeEngine.releaseMicroscope();
+            cameraExecutor.execute(() -> { busy = false; if (previewSurface != null && previewSurface.isValid()) startLivePreview(); });
         }
-        NativeEngine.setDualCameraCalibration(fx0, fy0, cx0, cy0, d0, fx2, fy2, cx2, cy2, d2, R, T_mm);
     }
 
-    private void startDualCameraScannerMode(String logicalId, boolean testFullRes) {
+    private void failFromWorker(String m) { cameraExecutor.execute(() -> fail(m)); }
+
+    /** Rotate a sensor-oriented bitmap so it appears upright with the phone held in portrait. */
+    private Bitmap upright(Bitmap src) {
+        if (src == null || sensorOrientation % 360 == 0) return src;
+        Matrix m = new Matrix(); m.postRotate(sensorOrientation);
+        Bitmap r = Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, true);
+        return r;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // stereo scan
+    // ------------------------------------------------------------------------------------------
+
+    private void startStereo(boolean fullRes) {
         cleanupCamera();
-        frameCount0.set(0); frameCount2.set(0);
+        final CameraTopology.StereoPair pair = topo.stereo;
+        if (pair == null) { fail("3D scanning needs two back cameras exposed as one logical camera — not available on this phone."); return; }
+        Size size = CameraTopology.commonStereoSize(pair.left, pair.right, fullRes);
+        if (size == null) { fail("The two cameras share no common stream size."); return; }
+        stW = size.getWidth(); stH = size.getHeight();
+
+        sensorOrientation = pair.left.sensorOrientation;
+        NativeEngine.setSensorOrientation(sensorOrientation);
+        CameraManager cm = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+        Integer ts = null;
+        try { ts = cm.getCameraCharacteristics(pair.logicalId).get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE); } catch (Exception ignored) {}
+        cameraClockRealtime = ts != null && ts == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
+        timeOffsetKnown = false;
+        NativeEngine.setImuTimeOffsetNs(0);
+        pairSyncNs = pair.calibratedSync ? 6_000_000L : 16_000_000L;
+
+        List<String> notes = new ArrayList<>();
+        StereoCalibration cal = StereoCalibration.build(outputDir(), pair, stW, stH, notes);
+        for (String n : notes) log(n);
         NativeEngine.resetStereoScanner();
-        CameraManager manager = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
-        try {
-            CameraCharacteristics logicalChars = manager.getCameraCharacteristics(logicalId);
-            Set<String> physicalIds = logicalChars.getPhysicalCameraIds();
-            Log.i(TAG, "Logical ID: " + logicalId + " | Physical IDs: " + physicalIds);
-            appendStatus("Binding Logical " + logicalId + " -> Physical: " + physicalIds);
-            if (!physicalIds.contains(PHYS_ID_WIDE) || !physicalIds.contains(PHYS_ID_UW)) {
-                setState("Dual camera combination (Wide + Ultra-Wide) unavailable on this device.", Color.rgb(255,138,128));
-                isBusyCapturing = false;
-                return;
-            }
+        NativeEngine.configureStereo(stW, stH, cal.params);
+        stereoInfo = NativeEngine.stereoInfo();
+        int rw = (int) stereoInfo[5], rh = (int) stereoInfo[6];
+        heatmap = new int[rw * rh];
+        listener.onStereoInfo(stereoInfo[0], stereoInfo[1], stereoInfo[2], cal.source);
+        log(String.format(Locale.US, "Stereo %dx%d, baseline %.1f mm, depth range %.0f–%.0f mm, calibration: %s", stW, stH, stereoInfo[0], stereoInfo[1], stereoInfo[2], cal.source));
+        pairFramesLogged = 0; lastDepthEmitMs = 0;
 
-            if (testFullRes) {
-                width0 = 4032; height0 = 3024; width2 = 4608; height2 = 3456;
-            } else {
-                StreamConfigurationMap map0, map2;
-                try {
-                    map0 = manager.getCameraCharacteristics(PHYS_ID_WIDE).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                    map2 = manager.getCameraCharacteristics(PHYS_ID_UW).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                } catch (IllegalArgumentException e) {
-                    map0 = logicalChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP); map2 = map0;
+        final int myRun;
+        synchronized (procLock) { myRun = runId; }
+        reader0 = ImageReader.newInstance(stW, stH, ImageFormat.YUV_420_888, 4);
+        reader2 = ImageReader.newInstance(stW, stH, ImageFormat.YUV_420_888, 4);
+        reader0.setOnImageAvailableListener(r -> onStereoImage(r, myRun, true), workHandler);
+        reader2.setOnImageAvailableListener(r -> onStereoImage(r, myRun, false), workHandler);
+
+        final Surface s0 = reader0.getSurface(), s2 = reader2.getSurface();
+        try {
+            cm.openCamera(pair.logicalId, cameraExecutor, new CameraDevice.StateCallback() {
+                @Override public void onOpened(CameraDevice dev) {
+                    if (!isCurrent(myRun)) { dev.close(); return; }
+                    cameraDevice = dev;
+                    try {
+                        OutputConfiguration c0 = new OutputConfiguration(s0); c0.setPhysicalCameraId(pair.left.physicalId);
+                        OutputConfiguration c2 = new OutputConfiguration(s2); c2.setPhysicalCameraId(pair.right.physicalId);
+                        dev.createCaptureSession(new SessionConfiguration(SessionConfiguration.SESSION_REGULAR, Arrays.asList(c0, c2), cameraExecutor,
+                            new CameraCaptureSession.StateCallback() {
+                                @Override public void onConfigured(CameraCaptureSession s) {
+                                    if (!isCurrent(myRun)) { s.close(); return; }
+                                    session = s;
+                                    try {
+                                        CaptureRequest.Builder b = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                                        b.addTarget(s0); b.addTarget(s2);
+                                        b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+                                        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                                        // Fixed focus keeps both lenses' focal lengths (and so the calibration) constant.
+                                        float near = Math.min(pair.left.minFocusDiopters, pair.right.minFocusDiopters);
+                                        if (near > 0f && has(pair.left.chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES), CameraMetadata.CONTROL_AF_MODE_OFF)) {
+                                            float subjectMm = Math.max(120f, stereoInfo[1] * 1.8f);
+                                            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+                                            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, Math.min(near, 1000f / subjectMm));
+                                        }
+                                        if (has(pair.left.chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION), CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF))
+                                            b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF);
+                                        s.setRepeatingRequest(b.build(), null, cameraHandler);
+                                        setState(String.format(Locale.US, "Scanning — keep the object %.0f–%.0f cm away and move slowly", stereoInfo[1] / 10f, Math.min(stereoInfo[2], 600f) / 10f), Listener.LEVEL_OK);
+                                    } catch (Exception e) { fail("Camera request failed: " + e.getMessage()); }
+                                }
+                                @Override public void onConfigureFailed(CameraCaptureSession s) {
+                                    fail(fullRes ? "The phone refused full-resolution dual streams — try Standard." : "The phone refused to stream both cameras at once.");
+                                }
+                            }));
+                    } catch (Exception e) { fail("Dual stream setup failed: " + e.getMessage()); }
                 }
-                Size[] s0 = map0.getOutputSizes(ImageFormat.YUV_420_888), s2 = map2.getOutputSizes(ImageFormat.YUV_420_888);
-                List<Size> matches = new ArrayList<>();
-                if (s0 != null && s2 != null) {
-                    Set<Size> set2 = new HashSet<>(Arrays.asList(s2));
-                    for (Size sz : s0) if (sz.getWidth() <= 1920 && sz.getHeight() <= 1080 && set2.contains(sz)) matches.add(sz);
+                @Override public void onDisconnected(CameraDevice dev) { dev.close(); if (isCurrent(myRun)) fail("Camera disconnected."); }
+                @Override public void onError(CameraDevice dev, int err) { dev.close(); if (isCurrent(myRun)) fail("Camera error " + err + "."); }
+            });
+        } catch (SecurityException e) { fail("Camera permission denied."); }
+        catch (CameraAccessException e) { fail("Camera access failed: " + e.getMessage()); }
+        catch (Exception e) { fail("Dual stream setup failed: " + e.getMessage()); }
+    }
+
+    private void onStereoImage(ImageReader r, int myRun, boolean isLeft) {
+        Image img;
+        try { img = r.acquireLatestImage(); } catch (Exception e) { return; }
+        if (img == null) return;
+        try {
+            synchronized (procLock) {
+                if (myRun != runId) return;
+                if (!cameraClockRealtime && !timeOffsetKnown) {
+                    NativeEngine.setImuTimeOffsetNs(SystemClock.elapsedRealtimeNanos() - img.getTimestamp());
+                    timeOffsetKnown = true;
                 }
-                if (matches.isEmpty()) {
-                    setState("No common stream size for dual cameras.", Color.rgb(255,138,128));
-                    isBusyCapturing = false;
+                Image.Plane yp = img.getPlanes()[0];
+                Slot slot = isLeft ? slotL : slotR;
+                int stride = yp.getRowStride(), h = img.getHeight(), cap = stride * h;
+                if (slot.y == null || slot.y.capacity() < cap) slot.y = ByteBuffer.allocateDirect(cap);
+                ByteBuffer src = yp.getBuffer();
+                slot.y.clear(); src.rewind(); slot.y.put(src); slot.y.rewind();
+                slot.ts = img.getTimestamp(); slot.w = img.getWidth(); slot.h = h; slot.stride = stride; slot.fresh = true;
+
+                if (!slotL.fresh || !slotR.fresh) return;
+                long dNs = Math.abs(slotL.ts - slotR.ts);
+                if (dNs > pairSyncNs) {                       // drop the older frame and wait for a better partner
+                    if (slotL.ts < slotR.ts) slotL.fresh = false; else slotR.fresh = false;
                     return;
                 }
-                matches.sort((a, b) -> {
-                    boolean a43 = Math.abs(a.getWidth()*3 - a.getHeight()*4) <= 16, b43 = Math.abs(b.getWidth()*3 - b.getHeight()*4) <= 16;
-                    if (a43 != b43 && a.getHeight() >= 1080 && b.getHeight() >= 1080) return a43 ? -1 : 1;
-                    return Integer.compare(b.getWidth()*b.getHeight(), a.getWidth()*a.getHeight());
-                });
-                Size opt = matches.get(0);
-                width0 = width2 = opt.getWidth(); height0 = height2 = opt.getHeight();
-                appendStatus("Negotiated dual stream: " + width0 + "x" + height0);
-            }
+                slotL.fresh = slotR.fresh = false;
+                if (++pairFramesLogged % 30 == 1) log(String.format(Locale.US, "Pair #%d  inter-camera skew %d µs", pairFramesLogged, dNs / 1000));
+                if (saveNextPair.compareAndSet(true, false)) savePairFiles(slotL, slotR);
 
-            configureStereoCalibration(manager, width0, height0);
-            manager.openCamera(logicalId, cameraExecutor, new CameraDevice.StateCallback() {
-                @Override public void onOpened(CameraDevice cam) {
-                    cameraDevice = cam;
-                    configureDualPhysicalStreams(logicalId, testFullRes);
+                int frames = NativeEngine.processStereoPair(slotL.y, slotL.stride, slotR.y, slotR.stride, slotL.w, slotL.h, slotL.ts, heatmap);
+                long now = SystemClock.elapsedRealtime();
+                if (frames >= 0 && now - lastDepthEmitMs > 120) {
+                    lastDepthEmitMs = now;
+                    int rw = (int) stereoInfo[5], rh = (int) stereoInfo[6];
+                    Bitmap bm = Bitmap.createBitmap(heatmap, rw, rh, Bitmap.Config.ARGB_8888);  // copies the pixels
+                    listener.onDepthFrame(rotateForDisplay(bm, (int) stereoInfo[4] + sensorOrientation));
                 }
-                @Override public void onDisconnected(CameraDevice cam) { cleanupCamera(); isBusyCapturing = false; }
-                @Override public void onError(CameraDevice cam, int err) { cleanupCamera(); isBusyCapturing = false; }
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "Init error", e);
-            isBusyCapturing = false;
+            }
+        } finally {
+            img.close();
         }
     }
 
-    private void configureDualPhysicalStreams(String logicalId, boolean testFullRes) {
-        try {
-            reader0 = ImageReader.newInstance(width0, height0, ImageFormat.YUV_420_888, 4);
-            reader2 = ImageReader.newInstance(width2, height2, ImageFormat.YUV_420_888, 4);
-            reader0.setOnImageAvailableListener(r -> { Image i = r.acquireLatestImage(); if (i != null) { onPhysicalFrame(i, true); i.close(); } }, cameraHandler);
-            reader2.setOnImageAvailableListener(r -> { Image i = r.acquireLatestImage(); if (i != null) { onPhysicalFrame(i, false); i.close(); } }, cameraHandler);
-
-            OutputConfiguration c0 = new OutputConfiguration(reader0.getSurface()); c0.setPhysicalCameraId(PHYS_ID_WIDE);
-            OutputConfiguration c2 = new OutputConfiguration(reader2.getSurface()); c2.setPhysicalCameraId(PHYS_ID_UW);
-
-            SessionConfiguration sc = new SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR, Arrays.asList(c0, c2), cameraExecutor,
-                new CameraCaptureSession.StateCallback() {
-                    @Override public void onConfigured(CameraCaptureSession session) {
-                        activeSession = session;
-                        setState("3D Scan Active (" + width0 + "x" + height0 + "). Move in an arc around subject.", Color.rgb(0,230,118));
-                        try {
-                            CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-                            b.addTarget(reader0.getSurface()); b.addTarget(reader2.getSurface());
-                            b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
-                            b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-                            b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 4.0f);
-                            b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF);
-                            b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
-                            session.setRepeatingRequest(b.build(), null, cameraHandler);
-                        } catch (CameraAccessException e) { Log.e(TAG, "Request error", e); }
-                    }
-                    @Override public void onConfigureFailed(CameraCaptureSession session) {
-                        Log.e(TAG, "CameraCaptureSession onConfigureFailed (" + width0 + "x" + height0 + ")");
-                        setState("Dual stream configuration failed on ID " + logicalId, Color.rgb(255,138,128));
-                        if (DEFAULT_LOGICAL_ID.equals(logicalId)) startDualCameraScannerMode(FALLBACK_LOGICAL_ID, testFullRes);
-                        else isBusyCapturing = false;
-                    }
-                }
-            );
-            cameraDevice.createCaptureSession(sc);
-        } catch (CameraAccessException e) {
-            Log.e(TAG, "Session error", e);
-            isBusyCapturing = false;
-        }
+    private static Bitmap rotateForDisplay(Bitmap src, int degrees) {
+        int d = ((degrees % 360) + 360) % 360;
+        if (d == 0) return src;
+        Matrix m = new Matrix(); m.postRotate(d);
+        return Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, false);
     }
 
-    private void onPhysicalFrame(Image img, boolean isCam0) {
-        long ts = img.getTimestamp();
-        Image.Plane yP = img.getPlanes()[0];
-        ByteBuffer src = yP.getBuffer();
-        int stride = yP.getRowStride(), w = img.getWidth(), h = img.getHeight();
-        synchronized (stereoSyncLock) {
-            FrameSlot slot = isCam0 ? latestSlot0 : latestSlot2;
-            int cap = stride * h;
-            if (slot == null || slot.directY == null || slot.directY.capacity() < cap) {
-                slot = new FrameSlot(); slot.directY = ByteBuffer.allocateDirect(cap);
-                if (isCam0) latestSlot0 = slot; else latestSlot2 = slot;
-            }
-            slot.timestampNs = ts; slot.width = w; slot.height = h; slot.rowStride = stride;
-            slot.directY.clear(); src.rewind(); slot.directY.put(src); slot.directY.rewind();
-            if (isCam0) frameCount0.incrementAndGet(); else frameCount2.incrementAndGet();
-
-            if (latestSlot0 != null && latestSlot2 != null) {
-                long dNs = Math.abs(latestSlot0.timestampNs - latestSlot2.timestampNs);
-                if (dNs < 10_000_000L) {
-                    long dUs = dNs / 1000L;
-                    int pc = frameCount0.get();
-                    if (pc % 15 == 0) {
-                        appendStatus("Synced Pair #" + pc + " | Jitter: " + dUs + " \u00b5s");
-                    }
-                    if (saveNextCalibrationPair.compareAndSet(true, false)) {
-                        int idx = calibrationPairCounter.getAndIncrement();
-                        File dir = ctx.getExternalFilesDir(null);
-                        if (dir != null) {
-                            writePgm(latestSlot0, new File(dir, String.format(Locale.US, "left_%02d.pgm", idx)));
-                            writePgm(latestSlot2, new File(dir, String.format(Locale.US, "right_%02d.pgm", idx)));
-                            appendStatus("Saved calibration pair #" + idx);
-                            setState("Saved pair #" + idx + " to storage.", Color.rgb(0, 230, 118));
-                        }
-                    }
-                    if (latestSlot0.width == latestSlot2.width && latestSlot0.height == latestSlot2.height) {
-                        int dw = latestSlot0.width / 4, dh = latestSlot0.height / 4;
-                        if (heatmapPixels == null || heatmapPixels.length != dw * dh) heatmapPixels = new int[dw * dh];
-                        NativeEngine.processStereoPair(latestSlot0.directY, latestSlot0.rowStride, latestSlot2.directY, latestSlot2.rowStride, latestSlot0.width, latestSlot0.height, latestSlot0.timestampNs, heatmapPixels);
-                        if (pc % 2 == 0) updateHeatmapUi(dw, dh);
-                    }
-                    latestSlot0.timestampNs = -100_000_000L;
-                }
-            }
-        }
+    private void savePairFiles(Slot l, Slot r) {
+        File dir = outputDir();
+        if (dir == null) return;
+        int idx = pairCounter++;
+        writePgm(l, new File(dir, String.format(Locale.US, "left_%02d.pgm", idx)));
+        writePgm(r, new File(dir, String.format(Locale.US, "right_%02d.pgm", idx)));
+        log("Saved calibration pair #" + idx + " (" + l.w + "×" + l.h + ")");
+        setState("Saved calibration pair #" + idx, Listener.LEVEL_OK);
     }
 
-    private void updateHeatmapUi(int dw, int dh) {
-        int[] copy = Arrays.copyOf(heatmapPixels, heatmapPixels.length);
-        Bitmap bm = Bitmap.createBitmap(dw, dh, Bitmap.Config.ARGB_8888);
-        bm.setPixels(copy, 0, dw, 0, 0, dw, dh);
-        listener.onImage(upright(bm));
-    }
-
-    private static void writePgm(FrameSlot s, File f) {
+    private static void writePgm(Slot s, File f) {
         try (FileOutputStream fos = new FileOutputStream(f)) {
-            fos.write(String.format(Locale.US, "P5\n%d %d\n255\n", s.width, s.height).getBytes(StandardCharsets.US_ASCII));
-            byte[] row = new byte[s.width]; ByteBuffer b = s.directY.duplicate();
-            for (int y = 0; y < s.height; ++y) { b.position(y * s.rowStride); b.get(row, 0, s.width); fos.write(row); }
+            fos.write(String.format(Locale.US, "P5\n%d %d\n255\n", s.w, s.h).getBytes(StandardCharsets.US_ASCII));
+            byte[] row = new byte[s.w]; ByteBuffer b = s.y.duplicate();
+            for (int y = 0; y < s.h; ++y) { b.position(y * s.stride); b.get(row, 0, s.w); fos.write(row); }
         } catch (Exception e) { Log.e(TAG, "PGM write failed", e); }
     }
 
-    private Bitmap extractDownscaledBaseline(Image img) {
-        try {
-            int w = img.getWidth(), h = img.getHeight();
-            int scale = 8;
-            int bw = w / scale, bh = h / scale;
-            int[] pixels = new int[bw * bh];
-            if (img.getFormat() == ImageFormat.RAW_SENSOR) {
-                Image.Plane p0 = img.getPlanes()[0];
-                ByteBuffer b = p0.getBuffer().duplicate();
-                b.rewind();
-                int st = p0.getRowStride();
-                byte[] row = new byte[st];
-                for (int y = 0; y < bh; ++y) {
-                    b.position(y * scale * st);
-                    b.get(row, 0, Math.min(row.length, b.remaining()));
-                    for (int x = 0; x < bw; ++x) {
-                        int idx = x * scale * 2;
-                        int val = (row[idx] & 0xFF) | ((row[idx + 1] & 0xFF) << 8);
-                        int lum = Math.min(255, val >> 2);
-                        pixels[y * bw + x] = 0xFF000000 | (lum << 16) | (lum << 8) | lum;
-                    }
-                }
-            } else {
-                Image.Plane pY = img.getPlanes()[0];
-                ByteBuffer yBuf = pY.getBuffer().duplicate();
-                yBuf.rewind();
-                int rowStride = pY.getRowStride();
-                byte[] row = new byte[Math.min(rowStride, w)];
-                for (int y = 0; y < bh; ++y) {
-                    yBuf.position(y * scale * rowStride);
-                    yBuf.get(row, 0, Math.min(row.length, yBuf.remaining()));
-                    for (int x = 0; x < bw; ++x) {
-                        int lum = row[x * scale] & 0xFF;
-                        pixels[y * bw + x] = 0xFF000000 | (lum << 16) | (lum << 8) | lum;
-                    }
-                }
-            }
-            return Bitmap.createBitmap(pixels, bw, bh, Bitmap.Config.ARGB_8888);
-        } catch (Exception e) {
-            Log.e(TAG, "Error extracting baseline preview", e);
-            return null;
-        }
-    }
+    // ------------------------------------------------------------------------------------------
 
-    void startMicroscopeMode(boolean useRaw16) {
-        cleanupCamera();
-        final int macroW = 4032, macroH = 3024;
-        NativeEngine.resetMicroscope(macroW, macroH);
-        baselineBeforeBitmap = null;
-        CameraManager manager = (CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
-        try {
-            CameraCharacteristics c0 = manager.getCameraCharacteristics(PHYS_ID_WIDE);
-            float[] apertures = c0.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES);
-            float[] focals = c0.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
-            SizeF physSz = c0.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
-            Integer cfa = c0.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
-            Integer wl = c0.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
-            BlackLevelPattern blp = c0.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
-
-            float fx = (focals != null && focals.length > 0 && physSz != null && physSz.getWidth() > 0) ? (macroW * focals[0] / physSz.getWidth()) : (0.762f * macroW);
-            float fy = (focals != null && focals.length > 0 && physSz != null && physSz.getHeight() > 0) ? (macroH * focals[0] / physSz.getHeight()) : (0.762f * macroW);
-            NativeEngine.configureMicroscopeOptics(fx, fy, cfa != null ? cfa : 0, blp != null ? blp.getOffsetForIndex(0, 0) : 64, wl != null ? wl : 1023);
-
-            final int fmt = useRaw16 ? ImageFormat.RAW_SENSOR : ImageFormat.YUV_420_888;
-            setState("Starting macro burst...", Color.rgb(255,213,79));
-            appendStatus("Capturing Macro Super-Res (" + (useRaw16 ? "RAW16 Bayer" : "Color YUV") + " @ 4032x3024)...");
-
-            manager.openCamera(PHYS_ID_WIDE, cameraExecutor, new CameraDevice.StateCallback() {
-                @Override public void onOpened(CameraDevice cam) {
-                    cameraDevice = cam;
-                    try {
-                        reader0 = ImageReader.newInstance(macroW, macroH, fmt, 4);
-                        reader0.setOnImageAvailableListener(r -> {
-                            Image img = r.acquireLatestImage(); if (img == null) return;
-                            long ts = img.getTimestamp(); int w = img.getWidth(), h = img.getHeight(), acc;
-
-                            if (baselineBeforeBitmap == null) {
-                                baselineBeforeBitmap = extractDownscaledBaseline(img);
-                            }
-
-                            if (img.getFormat() == ImageFormat.RAW_SENSOR) {
-                                Image.Plane p0 = img.getPlanes()[0]; int st = p0.getRowStride();
-                                ByteBuffer copy = cloneDirect(p0.getBuffer()); img.close();
-                                acc = NativeEngine.pushMicroscopeRaw16Frame(copy, st, w, h, ts);
-                            } else {
-                                Image.Plane pY = img.getPlanes()[0], pU = img.getPlanes()[1], pV = img.getPlanes()[2];
-                                ByteBuffer cY = cloneDirect(pY.getBuffer()), cU = cloneDirect(pU.getBuffer()), cV = cloneDirect(pV.getBuffer());
-                                int yS = pY.getRowStride(), uS = pU.getRowStride(), uP = pU.getPixelStride(), vS = pV.getRowStride(), vP = pV.getPixelStride();
-                                img.close();
-                                acc = NativeEngine.pushMicroscopeYuvFrame(cY, yS, cU, uS, uP, cV, vS, vP, w, h, ts);
-                            }
-
-                            setProgress(acc, MICROSCOPE_BURST_FRAMES);
-                            setState("Aligning frame " + acc + " of " + MICROSCOPE_BURST_FRAMES + " \u2014 Hold Steady", Color.rgb(255,213,79));
-                            if (acc >= MICROSCOPE_BURST_FRAMES) {
-                                cleanupCamera();
-                                setState("Reconstructing 2\u00d7 Drizzle Grid...", Color.rgb(255,213,79));
-                                File dir = ctx.getExternalFilesDir(null);
-                                File bmp = new File(dir, "microscope_2x_superres.bmp");
-                                File ppm = new File(dir, "microscope_2x_superres.ppm");
-                                File pgm = new File(dir, "microscope_2x_superres.pgm");
-                                boolean ok = NativeEngine.exportMicroscopeImages(bmp.getAbsolutePath(), ppm.getAbsolutePath(), pgm.getAbsolutePath());
-                                appendStatus(ok ? "Super-resolution saved: " + bmp.getName() : "Reconstruction failed");
-                                setProgress(0, 0);
-                                isBusyCapturing = false;
-
-                                if (ok && bmp.exists()) {
-                                    BitmapFactory.Options o = new BitmapFactory.Options();
-                                    o.inSampleSize = 8;
-                                    Bitmap afterBm = BitmapFactory.decodeFile(bmp.getAbsolutePath(), o);
-                                    setState("Finished! 2\u00d7 Super-Resolution Ready.", Color.rgb(0,230,118));
-                                    listener.onMacroResult(upright(baselineBeforeBitmap), upright(afterBm), bmp);
-                                } else {
-                                    setState("Reconstruction failed.", Color.rgb(255,138,128));
-                                }
-                            }
-                        }, cameraHandler);
-
-                        OutputConfiguration oc = new OutputConfiguration(reader0.getSurface());
-                        SessionConfiguration sc = new SessionConfiguration(
-                            SessionConfiguration.SESSION_REGULAR, Arrays.asList(oc), cameraExecutor,
-                            new CameraCaptureSession.StateCallback() {
-                                @Override public void onConfigured(CameraCaptureSession session) {
-                                    activeSession = session;
-                                    try {
-                                        CaptureRequest.Builder b = cam.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL);
-                                        b.addTarget(reader0.getSurface());
-                                        b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-                                        b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 10.0f);
-                                        b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
-                                        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 3_500_000L);
-                                        b.set(CaptureRequest.SENSOR_SENSITIVITY, 100);
-                                        b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF);
-                                        b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
-                                        b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF);
-                                        b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF);
-                                        if (apertures != null) for (float ap : apertures) if (Math.abs(ap - 2.4f) < 0.1f) b.set(CaptureRequest.LENS_APERTURE, 2.4f);
-                                        session.setRepeatingRequest(b.build(), null, cameraHandler);
-                                    } catch (CameraAccessException e) { Log.e(TAG, "Microscope req error", e); }
-                                }
-                                @Override public void onConfigureFailed(CameraCaptureSession s) {
-                                    Log.e(TAG, "Microscope config failed");
-                                    setState("Sensor refused burst format.", Color.rgb(255,138,128));
-                                    isBusyCapturing = false;
-                                }
-                            }
-                        );
-                        cam.createCaptureSession(sc);
-                    } catch (CameraAccessException e) {
-                        Log.e(TAG, "Microscope setup error", e);
-                        isBusyCapturing = false;
-                    }
-                }
-                @Override public void onDisconnected(CameraDevice c) { cleanupCamera(); isBusyCapturing = false; }
-                @Override public void onError(CameraDevice c, int e) { cleanupCamera(); isBusyCapturing = false; }
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "Microscope open error", e);
-            isBusyCapturing = false;
-        }
-    }
-
-    private static ByteBuffer cloneDirect(ByteBuffer src) {
-        src.rewind(); ByteBuffer copy = ByteBuffer.allocateDirect(src.remaining());
-        copy.put(src); copy.rewind(); return copy;
-    }
-
-    private void cleanupCamera() {
-        if (activeSession != null) { try { activeSession.close(); } catch (Exception ignored) {} activeSession = null; }
-        if (cameraDevice != null) { try { cameraDevice.close(); } catch (Exception ignored) {} cameraDevice = null; }
-        if (reader0 != null) { try { reader0.close(); } catch (Exception ignored) {} reader0 = null; }
-        if (reader2 != null) { try { reader2.close(); } catch (Exception ignored) {} reader2 = null; }
-        isPreviewActive = false;
-    }
+    /** Preview buffer size for the viewfinder (sensor aspect ratio, ~2 MP). */
+    public static Size choosePreviewSize(Context context) { return CameraTopology.previewSize(context.getApplicationContext()); }
 }

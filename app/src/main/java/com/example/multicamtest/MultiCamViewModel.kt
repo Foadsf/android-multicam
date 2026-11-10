@@ -4,8 +4,8 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Color as AColor
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.core.content.FileProvider
@@ -13,29 +13,34 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 enum class Mode { INSPECT, SCAN_3D, LABS }
 enum class Level { INFO, BUSY, OK, ERROR }
 
+/** Coarse UI state. High-frequency values (stability, depth frames) have their own flows to avoid recomposing everything. */
 data class UiState(
     val mode: Mode = Mode.INSPECT,
     val hasPermission: Boolean = false,
     val running: Boolean = false,
-    val message: String = "Align subject in viewfinder, then tap capture.",
+    val message: String = "Hold steady about 10 cm from a flat subject.",
     val level: Level = Level.INFO,
-    val stability: Float = 1.0f,
     val progress: Float? = null,
-    val image: Bitmap? = null,
     val beforeBitmap: Bitmap? = null,
     val afterBitmap: Bitmap? = null,
     val showComparison: Boolean = false,
     val comparisonSplit: Float = 0.5f,
-    val showAfter: Boolean = true,
+    val resultW: Int = 0,
+    val resultH: Int = 0,
     val lastResultFile: File? = null,
     val lastStlFile: File? = null,
     val lastPlyFile: File? = null,
@@ -48,57 +53,71 @@ data class UiState(
     val exporting: Boolean = false,
     val runStartedAt: Long = 0L,
     val pairsSaved: Int = 0,
+    // device capabilities / geometry (filled by the engine)
+    val stereoAvailable: Boolean = true,
+    val rawAvailable: Boolean = true,
+    val baselineMm: Float = 0f,
+    val zMinMm: Float = 0f,
+    val zMaxMm: Float = 0f,
+    val calibration: String = "",
 )
 
-/**
- * ViewModel driving CaptureEngine and maintaining state for Inspect, 3D Scan, and Labs modes.
- */
 class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine.Listener {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
-    private var engine: CaptureEngine? = null
 
+    private val _stability = MutableStateFlow(1.0f)
+    val stability: StateFlow<Float> = _stability.asStateFlow()
+
+    private val _depth = MutableStateFlow<Bitmap?>(null)
+    val depth: StateFlow<Bitmap?> = _depth.asStateFlow()
+
+    val hasDepth: StateFlow<Boolean> = _depth.map { it != null }.distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    private var engine: CaptureEngine? = null
     private fun engine(): CaptureEngine = engine ?: CaptureEngine(getApplication(), this).also { engine = it }
 
-    fun setPreviewSurface(surface: Surface?) {
-        engine().setPreviewSurface(surface)
-    }
+    /** Preview stream size (landscape sensor orientation); computed once from the camera metadata. */
+    val previewSize: android.util.Size by lazy { CaptureEngine.choosePreviewSize(getApplication()) }
+
+    fun setPreviewSurface(surface: Surface?) = engine().setPreviewSurface(surface)
 
     fun setPermission(granted: Boolean) {
         _ui.update { it.copy(hasPermission = granted) }
-        if (granted) {
-            engine().resumePreview()
-        }
+        if (granted) { engine().setActive(true); engine().resumePreview() }
     }
 
+    /** UI went to the background: stop captures and release the camera. */
+    fun onBackground() {
+        engine?.pause()
+        _ui.update { it.copy(running = false, progress = null, exporting = false, level = if (it.level == Level.BUSY) Level.INFO else it.level) }
+    }
+
+    fun onForeground() { if (_ui.value.hasPermission) { engine().setActive(true); engine().resumePreview() } }
+
     fun setMode(m: Mode) {
-        if (_ui.value.running) return
+        if (_ui.value.running || _ui.value.exporting) return
+        _depth.value = null
         _ui.update {
             it.copy(
-                mode = m,
-                image = null,
-                beforeBitmap = null,
-                afterBitmap = null,
-                showComparison = false,
-                progress = null,
-                level = Level.INFO,
+                mode = m, beforeBitmap = null, afterBitmap = null, showComparison = false,
+                lastStlFile = null, lastPlyFile = null, lastTriangles = 0, progress = null, level = Level.INFO,
                 message = when (m) {
                     Mode.INSPECT -> "Hold steady about 10 cm from a flat subject."
-                    Mode.SCAN_3D -> "Aim both lenses at a textured object, 15\u201340 cm away."
+                    Mode.SCAN_3D -> if (it.stereoAvailable) "Aim both lenses at a textured object." else "This phone does not expose a usable dual-camera pair."
                     Mode.LABS -> "Raw stereo stream, calibration pairs and diagnostics."
-                }
+                },
             )
         }
         engine().resumePreview()
     }
 
-    fun toggleRaw() = _ui.update { it.copy(rawMacro = !it.rawMacro) }
+    fun toggleRaw() = _ui.update { if (it.rawAvailable) it.copy(rawMacro = !it.rawMacro) else it }
     fun toggleFullRes() = _ui.update { it.copy(fullRes = !it.fullRes) }
     fun showGuide(v: Boolean) = _ui.update { it.copy(showGuide = v) }
     fun showConsole(v: Boolean) = _ui.update { it.copy(showConsole = v) }
-
-    /** Preview stream size chosen for the live viewfinder (landscape sensor orientation). */
-    val previewSize: android.util.Size by lazy { CaptureEngine.choosePreviewSize(getApplication()) }
+    fun setComparisonSplit(split: Float) = _ui.update { it.copy(comparisonSplit = split.coerceIn(0f, 1f)) }
 
     /** Back press: close whatever is on top. Returns true if something was dismissed. */
     fun handleBack(): Boolean {
@@ -112,25 +131,12 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
         }
     }
 
-    fun toggleComparisonView() {
-        _ui.update { it.copy(showAfter = !it.showAfter) }
-    }
-
-    fun setComparisonSplit(split: Float) {
-        _ui.update { it.copy(comparisonSplit = split.coerceIn(0f, 1f)) }
-    }
-
     fun dismissResult() {
+        _depth.value = null
         _ui.update {
             it.copy(
-                image = null,
-                beforeBitmap = null,
-                afterBitmap = null,
-                showComparison = false,
-                lastStlFile = null,
-                lastPlyFile = null,
-                lastTriangles = 0,
-                message = "Viewfinder ready."
+                beforeBitmap = null, afterBitmap = null, showComparison = false,
+                lastStlFile = null, lastPlyFile = null, lastTriangles = 0, message = "Viewfinder ready.", level = Level.INFO,
             )
         }
         engine().resumePreview()
@@ -138,59 +144,66 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
 
     fun shutter() {
         val s = _ui.value
-        if (!s.hasPermission) return
+        if (!s.hasPermission || s.exporting) return
         if (s.running) {
             engine().stop()
-            _ui.update {
-                it.copy(
-                    running = false, progress = null, level = Level.INFO, message = "Stopped.",
-                    image = if (s.mode == Mode.SCAN_3D) it.image else null,
-                )
-            }
-            // In 3D mode, stopping the stream finishes the scan and builds the mesh.
-            if (s.mode == Mode.SCAN_3D) exportMesh()
+            _ui.update { it.copy(running = false, progress = null, level = Level.INFO, message = "Stopped.") }
+            if (s.mode == Mode.SCAN_3D) exportMesh()   // stopping a 3D scan finishes it and builds the mesh
+            else _depth.value = null
             return
         }
+        if (s.mode != Mode.INSPECT && !s.stereoAvailable) {
+            _ui.update { it.copy(level = Level.ERROR, message = "3D scanning needs two back cameras exposed as one logical camera — not available on this phone.") }
+            return
+        }
+        _depth.value = null
         _ui.update {
             it.copy(
-                running = true,
-                runStartedAt = android.os.SystemClock.elapsedRealtime(),
-                progress = null,
-                level = Level.BUSY,
-                showComparison = false,
-                image = null,
-                beforeBitmap = null,
-                afterBitmap = null,
+                running = true, runStartedAt = SystemClock.elapsedRealtime(), progress = null, level = Level.BUSY,
+                showComparison = false, beforeBitmap = null, afterBitmap = null,
                 message = when (s.mode) {
-                    Mode.INSPECT -> "Capturing burst\u2026"
-                    Mode.SCAN_3D -> "Starting 3D scan\u2026"
-                    Mode.LABS -> "Starting stereo stream\u2026"
-                }
+                    Mode.INSPECT -> "Preparing burst…"
+                    Mode.SCAN_3D -> "Starting 3D scan…"
+                    Mode.LABS -> "Starting stereo stream…"
+                },
             )
         }
-        if (s.mode == Mode.INSPECT) {
-            engine().startMacro(s.rawMacro)
-        } else {
-            engine().startScan(s.fullRes)
-        }
+        if (s.mode == Mode.INSPECT) engine().startMacro(s.rawMacro) else engine().startScan(s.fullRes)
     }
 
     fun savePair() {
-        if (_ui.value.running) {
-            engine().savePair()
-            _ui.update { it.copy(pairsSaved = it.pairsSaved + 1) }
-        }
+        if (_ui.value.running) { engine().savePair(); _ui.update { it.copy(pairsSaved = it.pairsSaved + 1) } }
     }
 
     fun exportMesh() {
         if (_ui.value.exporting) return
-        _ui.update { it.copy(exporting = true, level = Level.BUSY, message = "Building 3D mesh\u2026") }
-        viewModelScope.launch(Dispatchers.IO) {
+        _ui.update { it.copy(exporting = true, level = Level.BUSY, message = "Building 3D mesh…") }
+        viewModelScope.launch(Dispatchers.Default) {
             val tris = engine().exportMesh()
             _ui.update {
-                if (tris > 0) it.copy(exporting = false, level = Level.OK, message = "Mesh exported: $tris triangles")
-                else it.copy(exporting = false, level = Level.ERROR, message = "No mesh yet \u2014 scan a textured object for a few seconds first.")
+                if (tris > 0) it.copy(exporting = false, level = Level.OK, message = "Mesh ready: $tris triangles")
+                else it.copy(exporting = false, level = Level.ERROR, message = "No surface yet — scan a textured object for a few seconds first.")
             }
+        }
+    }
+
+    /** Copies a user-selected stereo_calibration.json into the app folder (validated as JSON first). */
+    fun importCalibration(uri: Uri) {
+        viewModelScope.launch {
+            val msg = withContext(Dispatchers.IO) {
+                try {
+                    val ctx = getApplication<Application>()
+                    val text = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                        ?: return@withContext "Could not read the selected file." to Level.ERROR
+                    org.json.JSONObject(text)  // throws when malformed
+                    File(engine().outputDir(), StereoCalibration.FILE_NAME).writeText(text)
+                    "Calibration imported — it will be used by the next scan." to Level.OK
+                } catch (e: Exception) {
+                    "That file is not a valid calibration JSON: ${e.message}" to Level.ERROR
+                }
+            }
+            _ui.update { it.copy(message = msg.first, level = msg.second) }
+            onLog(msg.first)
         }
     }
 
@@ -203,12 +216,10 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val chooser = Intent.createChooser(intent, "Share ${file.name}").apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(chooser)
+            context.startActivity(Intent.createChooser(intent, "Share ${file.name}").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } catch (e: Exception) {
-            Log.e("MultiCamVM", "Failed to share file: ${file.name}", e)
+            Log.e("MultiCamVM", "Failed to share ${file.name}", e)
+            _ui.update { it.copy(level = Level.ERROR, message = "Nothing on this phone can handle that share.") }
         }
     }
 
@@ -218,77 +229,67 @@ class MultiCamViewModel(app: Application) : AndroidViewModel(app), CaptureEngine
             val uri: Uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, mimeType)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
         } catch (e: Exception) {
-            Log.e("MultiCamVM", "Failed to open file: ${file.name}", e)
+            Log.e("MultiCamVM", "Failed to open ${file.name}", e)
+            _ui.update { it.copy(level = Level.ERROR, message = "No app installed can open ${file.extension.uppercase()} files — use Share instead.") }
         }
     }
 
     // ---- CaptureEngine.Listener ----
-    override fun onState(message: String, color: Int) {
-        val level = when (color) {
-            AColor.rgb(0, 230, 118) -> Level.OK
-            AColor.rgb(255, 138, 128) -> Level.ERROR
-            AColor.rgb(255, 213, 79) -> Level.BUSY
+    override fun onState(message: String, level: Int) {
+        val l = when (level) {
+            CaptureEngine.Listener.LEVEL_OK -> Level.OK
+            CaptureEngine.Listener.LEVEL_ERROR -> Level.ERROR
+            CaptureEngine.Listener.LEVEL_BUSY -> Level.BUSY
             else -> Level.INFO
         }
-        _ui.update { it.copy(message = message, level = level, running = if (level == Level.ERROR) false else it.running) }
+        _ui.update { it.copy(message = message, level = l, running = if (l == Level.ERROR) false else it.running, progress = if (l == Level.ERROR) null else it.progress) }
     }
 
     override fun onProgress(value: Int, max: Int) {
-        _ui.update {
-            when {
-                max > 0 -> it.copy(progress = value.toFloat() / max)
-                it.mode == Mode.INSPECT -> it.copy(progress = null, running = false)
-                else -> it.copy(progress = null)
-            }
-        }
+        _ui.update { if (max > 0) it.copy(progress = (value.toFloat() / max).coerceIn(0f, 1f)) else it.copy(progress = null) }
     }
 
     override fun onStability(stability: Float) {
-        _ui.update { it.copy(stability = stability) }
+        // quantised so tiny sensor jitter does not cause recomposition
+        val q = Math.round(stability * 20f) / 20f
+        if (q != _stability.value) _stability.value = q
     }
 
-    override fun onLog(line: String) {
-        _ui.update { it.copy(log = (it.log + line).takeLast(200)) }
-    }
+    override fun onLog(line: String) { _ui.update { it.copy(log = (it.log + line).takeLast(300)) } }
 
-    override fun onImage(bitmap: Bitmap) {
-        _ui.update { it.copy(image = bitmap) }
-    }
+    override fun onDepthFrame(bitmap: Bitmap) { _depth.value = bitmap }
 
-    override fun onMacroResult(before: Bitmap?, after: Bitmap?, file: File?) {
+    override fun onMacroResult(before: Bitmap?, after: Bitmap?, file: File?, outWidth: Int, outHeight: Int) {
         _ui.update {
             it.copy(
-                beforeBitmap = before,
-                afterBitmap = after,
-                image = after ?: before,
-                lastResultFile = file,
-                showComparison = (before != null && after != null),
-                running = false,
-                progress = null,
-                level = Level.OK,
-                message = "2\u00d7 Super-Resolution complete!"
+                beforeBitmap = before, afterBitmap = after, lastResultFile = file, resultW = outWidth, resultH = outHeight,
+                showComparison = before != null && after != null, running = false, progress = null,
+                level = Level.OK, message = "2× super-resolution ready.",
             )
         }
     }
 
     override fun onScanResult(stlFile: File?, plyFile: File?, triangleCount: Int) {
+        if (triangleCount <= 0) _depth.value = null
         _ui.update {
             it.copy(
-                lastStlFile = stlFile,
-                lastPlyFile = plyFile,
-                lastTriangles = triangleCount,
-                image = if (triangleCount > 0) it.image else null,
-                running = false,
-                progress = null,
+                lastStlFile = stlFile, lastPlyFile = plyFile, lastTriangles = triangleCount, running = false, progress = null,
                 level = if (triangleCount > 0) Level.OK else Level.ERROR,
-                message = if (triangleCount > 0) "3D Model Ready ($triangleCount triangles)." else "No surface reconstructed."
+                message = if (triangleCount > 0) "3D model ready ($triangleCount triangles)." else "No surface reconstructed.",
             )
         }
+    }
+
+    override fun onStereoInfo(baselineMm: Float, zMinMm: Float, zMaxMm: Float, calibration: String) {
+        _ui.update { it.copy(baselineMm = baselineMm, zMinMm = zMinMm, zMaxMm = zMaxMm, calibration = calibration) }
+    }
+
+    override fun onCapabilities(stereo: Boolean, raw: Boolean) {
+        _ui.update { it.copy(stereoAvailable = stereo, rawAvailable = raw, rawMacro = it.rawMacro && raw) }
     }
 
     override fun onCleared() {
